@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+launcher/secrets_local.py
+.vscode/
+.idea/
+*.log
