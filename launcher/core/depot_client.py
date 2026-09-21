@@ -60,8 +60,13 @@ class DepotClient:
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503])
-        self.session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=16))
-        self.session.mount("http://",  HTTPAdapter(max_retries=retry, pool_maxsize=16))
+        # pool_maxsize здесь ограничивает число держащихся живыми соединений к
+        # одному хосту — должен быть >= максимального параллелизма, который
+        # заведёт любой воркер (сейчас максимум — CHUNK_MAX_WORKERS в
+        # chunk_installer.py, см. его комментарий) — иначе именно пул
+        # соединений, а не сеть/диск, становится узким местом.
+        self.session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=48))
+        self.session.mount("http://",  HTTPAdapter(max_retries=retry, pool_maxsize=48))
 
     # ── URL helpers ───────────────────────────────────────────────────────────
 

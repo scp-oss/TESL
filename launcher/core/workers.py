@@ -16,7 +16,7 @@ import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from config import (
-    MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
+    MAX_WORKERS, CHUNK_MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
     DEPOT_REMOTE_PATH, MANIFEST_CACHE, MANIFEST_CHUNK_DB_CACHE,
 )
 from core.depot_client import DepotClient, _sha256
@@ -317,7 +317,7 @@ class DownloadWorker(ThreadSafeWorker):
         installer = ChunkInstaller(
             client=self._client,
             local_dir=local_dir,
-            max_workers=min(MAX_WORKERS, 8),
+            max_workers=CHUNK_MAX_WORKERS,
             on_log=self.log.emit,
             on_progress_max=self.progress_total_setmax.emit,
             on_progress=self.progress_total.emit,
