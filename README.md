@@ -45,9 +45,19 @@ python main.py
 
 ## Сборка .exe
 
+Локально:
 ```
 cd launcher
 "build pyw.bat"
 ```
 (PyInstaller, `--onefile --windowed`, см. сам батник). Пароль WebDAV должен быть
 виден на момент сборки (ENV или `secrets_local.py`) — он встраивается в бинарник.
+
+Через GitHub Actions (`.github/workflows/build-release.yml`, раннер `windows-latest`) —
+собирает `TESL.exe` и публикует его в [Releases](../../releases):
+- автоматически при пуше тега `v*` (например `git tag v19.0.8 && git push origin v19.0.8`);
+- вручную — Actions → "Build & release TESL.exe" → Run workflow, указав тег.
+
+Требует репозиторный секрет `TESL_DAV_PASSWORD` (Settings → Secrets and variables →
+Actions) — без него соберётся рабочий .exe, но без пароля WebDAV он не сможет ничего
+скачать (см. предупреждение в логе сборки).

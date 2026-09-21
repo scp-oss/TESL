@@ -1,0 +1,88 @@
+name: Build & release TESL.exe
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза (например v19.0.8). Пусто при пуше тега — берётся из тега."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Секрет встраивается в собранный .exe на этом шаге (файл существует только
+      # на диске раннера, в git не попадает — см. launcher/CLAUDE.md "Секреты и их
+      # модель угроз"). Нужен репозиторный секрет TESL_DAV_PASSWORD.
+      - name: Write embedded WebDAV secret for this build
+        working-directory: launcher
+        shell: python
+        env:
+          TESL_DAV_PASSWORD: ${{ secrets.TESL_DAV_PASSWORD }}
+        run: |
+          import json
+          import os
+
+          pwd = os.environ.get("TESL_DAV_PASSWORD", "")
+          if not pwd:
+              print(
+                  "::warning::TESL_DAV_PASSWORD secret не задан — соберётся "
+                  "рабочий .exe, но без пароля WebDAV он не сможет ничего "
+                  "скачать. Задайте секрет в Settings → Secrets and variables "
+                  "→ Actions и перезапустите workflow."
+              )
+          with open("secrets_local.py", "w", encoding="utf-8") as f:
+              f.write(f"DAV_PASSWORD = {json.dumps(pwd)}\n")
+
+      - name: Build TESL.exe
+        working-directory: launcher
+        run: >
+          pyinstaller --noconsole --onefile --windowed --icon=icon.ico
+          --add-data "icon.ico;." --name TESL main.py
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TESL-exe-${{ steps.tag.outputs.tag }}
+          path: launcher/dist/TESL.exe
+
+      - name: Create/update GitHub release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" "launcher/dist/TESL.exe" \
+            --repo "${{ github.repository }}" \
+            --title "TESL $TAG" \
+            --generate-notes \
+          || gh release upload "$TAG" "launcher/dist/TESL.exe" \
+            --repo "${{ github.repository }}" --clobber
