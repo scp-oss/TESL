@@ -17,9 +17,11 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from config import (
     MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
-    DEPOT_REMOTE_PATH, MANIFEST_CACHE,
+    DEPOT_REMOTE_PATH, MANIFEST_CACHE, MANIFEST_CHUNK_DB_CACHE,
 )
 from core.depot_client import DepotClient, _sha256
+from core.chunk_manifest_db import read_manifest_db
+from core.chunk_installer import ChunkInstaller
 
 
 # ── Base ──────────────────────────────────────────────────────────────────────
@@ -145,6 +147,15 @@ class DownloadWorker(ThreadSafeWorker):
 
             self._client = DepotClient()
 
+            # Пробуем chunk-протокол (см. config.py "Chunk-based версии") —
+            # для версий, опубликованных как content-addressed чанки, а не
+            # плоские files/<rel_path>. Не найден компаньон manifest.db —
+            # обычный, ожидаемый случай, просто работаем по старому пути.
+            chunk_result = self._try_chunk_install(version_label, local_dir)
+            if chunk_result is not None:
+                self.finished.emit(chunk_result)
+                return
+
             # Скачиваем манифест
             self.log.emit("📥 Загружаем манифест...")
             manifest = self._client.fetch_manifest(version_label)
@@ -251,6 +262,71 @@ class DownloadWorker(ThreadSafeWorker):
         finally:
             if self._client:
                 self._client.close()
+
+    # ── Chunk-протокол (см. config.py "Chunk-based версии") ─────────────────────
+
+    def _get_version_manifest_rel_path(self, version_label: Optional[str]) -> Optional[str]:
+        """Находим путь к JSON-манифесту версии (info['manifest']) — нужен
+        только чтобы вычислить путь к её .db-компаньону, сам JSON тут не
+        скачивается (обычный путь скачает его сам через fetch_manifest())."""
+        index = self._client.fetch_depot_index()
+        if not index:
+            return None
+        if version_label is None:
+            current_key = index.get("current", {}).get("stable")
+            if not current_key:
+                return None
+            info = index.get("versions", {}).get(current_key)
+        else:
+            info = None
+            for release in index.get("versions", {}).values():
+                if release.get("label") == version_label:
+                    info = release
+                    break
+        return info.get("manifest") if info else None
+
+    def _try_chunk_install(self, version_label: Optional[str], local_dir: Path) -> Optional[bool]:
+        """
+        Возвращает None, если для этой версии нет chunk-манифеста (компаньона
+        .db) — значит нужно работать по обычному "плоскому" пути (files/<rel>).
+        Возвращает True/False, если реально запустили chunk-установку.
+
+        Сама загрузка/сборка/верификация — в `core.chunk_installer.ChunkInstaller`
+        (без Qt-зависимости, юнит-тестируется отдельно) — этот метод только
+        находит манифест и прокидывает Qt-сигналы в его колбэки.
+        """
+        manifest_rel = self._get_version_manifest_rel_path(version_label)
+        if not manifest_rel:
+            return None
+
+        db_bytes = self._client.fetch_manifest_db_bytes(manifest_rel)
+        if db_bytes is None:
+            return None
+
+        self.log.emit("📦 Обнаружен chunk-манифест — устанавливаем напрямую из chunks/ на сервере")
+        try:
+            MANIFEST_CHUNK_DB_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            MANIFEST_CHUNK_DB_CACHE.write_bytes(db_bytes)
+            entries, meta = read_manifest_db(MANIFEST_CHUNK_DB_CACHE)
+        except Exception as e:
+            self.log.emit(f"❌ Не удалось прочитать chunk-манифест: {e}")
+            return False
+
+        self.log.emit(f"📋 Версия по chunk-манифесту: {meta.get('version_key', '?')}")
+
+        installer = ChunkInstaller(
+            client=self._client,
+            local_dir=local_dir,
+            max_workers=min(MAX_WORKERS, 8),
+            on_log=self.log.emit,
+            on_progress_max=self.progress_total_setmax.emit,
+            on_progress=self.progress_total.emit,
+            on_current=self.current_file.emit,
+            on_speed=self.speed_update.emit,
+            should_stop=self._should_stop,
+            wait_if_paused=self._wait_if_paused,
+        )
+        return installer.install(entries)
 
 
 # ── Verify worker ─────────────────────────────────────────────────────────────

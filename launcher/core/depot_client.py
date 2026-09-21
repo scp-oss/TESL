@@ -24,7 +24,7 @@ from requests.auth import HTTPBasicAuth
 from config import (
     DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
     DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, POSTER_FILENAME,
-    MANIFEST_CACHE, POSTER_CACHE,
+    MANIFEST_CACHE, POSTER_CACHE, CHUNK_DIR,
 )
 
 
@@ -75,6 +75,9 @@ class DepotClient:
             quote(seg, safe="") for seg in rel_path.strip("/").split("/")
         ]
         return "/".join(segments)
+
+    def _chunk_url(self, chunk_id: str) -> str:
+        return self._url(CHUNK_DIR, chunk_id[:2], chunk_id)
 
     # ── depot.json ────────────────────────────────────────────────────────────
 
@@ -164,6 +167,39 @@ class DepotClient:
         except Exception:
             pass
         return None
+
+    # ── manifest.db (chunk-протокол, см. config.py "Chunk-based версии") ───────
+
+    def fetch_manifest_db_bytes(self, manifest_json_rel_path: str) -> Optional[bytes]:
+        """
+        Пробуем скачать компаньон обычного JSON-манифеста версии — тот же
+        путь, расширение `.db` вместо `.json`. Обычный, ожидаемый исход —
+        HTTP 404 (версия опубликована по старому "плоскому" протоколу, без
+        чанков) — тогда просто возвращаем None, это НЕ ошибка.
+        """
+        if not manifest_json_rel_path.endswith(".json"):
+            return None
+        db_rel_path = manifest_json_rel_path[: -len(".json")] + ".db"
+        try:
+            r = self.session.get(self._url(db_rel_path), timeout=60)
+            if r.status_code == 200:
+                return r.content
+        except Exception:
+            pass
+        return None
+
+    def download_chunk(self, chunk_id: str) -> Optional[bytes]:
+        """Скачиваем один чанк по chunk_id и верифицируем его sha256."""
+        try:
+            r = self.session.get(self._chunk_url(chunk_id), timeout=120)
+        except Exception:
+            return None
+        if r.status_code != 200:
+            return None
+        data = r.content
+        if hashlib.sha256(data).hexdigest() != chunk_id:
+            return None
+        return data
 
     # ── poster.png ────────────────────────────────────────────────────────────
 

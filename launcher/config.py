@@ -38,6 +38,19 @@ DEPOT_JSON_NAME = "depot.json"
 # Постер — берётся из корня DEPOT_REMOTE_PATH
 POSTER_FILENAME = "poster.png"
 
+# ── Chunk-based версии (см. core/chunk_manifest_db.py) ────────────────────────
+# Некоторые версии физически хранятся как content-addressed чанки
+# (chunks/<xx>/<id>) вместо плоских files/<rel_path> — так был опубликован
+# минимум один реальный билд (см. TESL-Manager::CLAUDE.md "Восстановление
+# сборки из чанков"). Для таких версий рядом с обычным JSON-манифестом лежит
+# компаньон manifest.db (SQLite, тот же путь, расширение .db вместо .json —
+# генерируется TESL-Manager'ом, depot_sync_manager/build_manifest_db.py).
+# DownloadWorker сначала пробует его найти и, если он есть, качает сборку
+# напрямую из chunks/, не трогая files/<rel_path> вообще; если компаньона
+# нет (обычный HTTP 404) — молча работает по старому, "плоскому" протоколу.
+# (путь MANIFEST_CHUNK_DB_CACHE определён ниже, после APPDATA_DIR)
+CHUNK_DIR = "chunks"
+
 # ── Старый JSON-сервер (для совместимости bootstrap'а) ────────────────────────
 JSON_SERVER = "https://nethunter.sytes.net/sky/"
 
@@ -51,6 +64,7 @@ PROGRESS_FILE    = APPDATA_DIR / "progress.json"
 LOG_FILE         = APPDATA_DIR / "launcher.log"
 MANIFEST_CACHE   = APPDATA_DIR / "manifest.json"   # кэш манифеста с сервера
 POSTER_CACHE     = APPDATA_DIR / "poster.png"
+MANIFEST_CHUNK_DB_CACHE = APPDATA_DIR / "manifest_chunk_cache.db"   # см. CHUNK_DIR выше
 
 APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 
