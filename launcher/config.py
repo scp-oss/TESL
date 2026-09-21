@@ -43,8 +43,13 @@ MO2_REMOTE_PATH     = "1TB/MO2p"           # отдельный Mod Organizer (�
 # depot.json — индекс версий сборки (лежит в DEPOT_REMOTE_PATH)
 DEPOT_JSON_NAME = "depot.json"
 
-# Постер — берётся из корня DEPOT_REMOTE_PATH
-POSTER_FILENAME = "poster.png"
+# Постер — подтверждено 2026-09-21: живёт СОВСЕМ в другой ветке, не рядом с
+# depot.json/chunks/versions — "Profils/<имя сборки>", не "Instances/<имя
+# сборки>", и имя файла не poster.png, а image.png. Поэтому — отдельный
+# независимый путь, не выводится из DEPOT_REMOTE_PATH (fetch_poster() строит
+# URL из этой пары напрямую, не через self.remote_path).
+POSTER_REMOTE_PATH = "1TB/TESS/Profils/TESVAE"
+POSTER_FILENAME    = "image.png"
 
 # ── Chunk-based версии (см. core/chunk_manifest_db.py) ────────────────────────
 # Некоторые версии физически хранятся как content-addressed чанки

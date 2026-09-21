@@ -23,7 +23,7 @@ from requests.auth import HTTPBasicAuth
 
 from config import (
     DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
-    DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, POSTER_FILENAME,
+    DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, POSTER_REMOTE_PATH, POSTER_FILENAME,
     MANIFEST_CACHE, POSTER_CACHE, CHUNK_DIR,
 )
 
@@ -209,9 +209,20 @@ class DepotClient:
     # ── poster.png ────────────────────────────────────────────────────────────
 
     def fetch_poster(self) -> Optional[bytes]:
-        """Скачиваем постер (PNG). Кэшируем локально."""
+        """
+        Скачиваем постер (PNG). Кэшируем локально.
+        Постер живёт в СВОЕЙ, отдельной от depot ветке (POSTER_REMOTE_PATH —
+        "Profils/<сборка>", не "Instances/<сборка>", где лежат depot.json/
+        chunks/versions) — поэтому URL строится напрямую от DAV_BASE_URL,
+        не через self._url() (тот всегда подставляет self.remote_path).
+        """
+        url = "/".join([
+            self.base,
+            POSTER_REMOTE_PATH.strip("/"),
+            quote(POSTER_FILENAME, safe=""),
+        ])
         try:
-            r = self.session.get(self._url(POSTER_FILENAME), timeout=20)
+            r = self.session.get(url, timeout=20)
             if r.status_code == 200:
                 POSTER_CACHE.write_bytes(r.content)
                 return r.content

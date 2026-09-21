@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
 
 from config import (
     WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR,
-    MO2_EXE, MO2_SKSE_ARG,
+    MO2_EXE, MO2_SKSE_ARG, get_asset_path,
 )
 from core.workers import (
     ThreadSafeWorker, VersionLoaderWorker, DownloadWorker,
@@ -107,6 +107,9 @@ class UpdaterUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
+        icon_path = get_asset_path("icon.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(780, 500)
         self.setMinimumSize(700, 440)
 
