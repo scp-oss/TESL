@@ -467,8 +467,7 @@ class UpdaterUI(QWidget):
         if action == FirstRunDialog.ACTION_PATCH_EXISTING:
             self._append_log("Запускаем патчинг найденного Skyrim...")
             self._patch_skyrim()
-        elif action in (FirstRunDialog.ACTION_DOWNLOAD_OURS,
-                        FirstRunDialog.ACTION_PIRATE_DOWNLOAD):
+        elif action == FirstRunDialog.ACTION_DOWNLOAD_OURS:
             self._append_log("Выберите папку для установки и нажмите «Установить»")
             if not self._full_local_path:
                 self._choose_folder()

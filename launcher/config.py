@@ -31,7 +31,6 @@ DEPOT_REMOTE_PATH   = "1TB/ModOrganizer"   # основные файлы MO2-с�
 PATCHER_REMOTE_PATH = "1TB/Patcher"        # файлы патчера
 SKYRIM_REMOTE_PATH  = "1TB/TESV1.6.1170.0" # лицензионная версия Skyrim
 MO2_REMOTE_PATH     = "1TB/MO2p"           # отдельный Mod Organizer
-CRACK_REMOTE_PATH   = "1TB/crack"          # кряк (пустая, WIP)
 
 # depot.json — индекс версий сборки (лежит в DEPOT_REMOTE_PATH)
 DEPOT_JSON_NAME = "depot.json"

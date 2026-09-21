@@ -2,16 +2,24 @@
 """
 Диалог первого запуска — определяет что делать со Skyrim.
 
+Раздача "нашей версии" (патченой/даунгрейженой) — ТОЛЬКО для подтверждённой
+Steam-лицензии (SkyrimChecker.is_licensed, см. core/skyrim_checker.py). Без
+подтверждённой лицензии предлагается только Steam — никакой раздачи без
+проверки владения (см. CLAUDE.md, "Легитимность — не факультативно").
+
 Дерево решений:
-  Skyrim AE найден + версия OK + DLC OK
+  Skyrim найден, БЕЗ лицензии (нет steam_api64.dll / Steam не найден)
+    → только "Купить/установить в Steam"
+
+  Skyrim AE найден + лицензия + версия OK + DLC OK
     → "Пропатчить" или "Скачать нашу версию поверх"
 
-  Skyrim найден, версия НЕ та (например 1.5.x)
-    → "Скачать нашу версию" (только этот вариант)
+  Skyrim найден + лицензия, версия НЕ та или DLC неполные
+    → "Скачать нашу версию" + "через Steam"
 
   Skyrim не найден:
-    Лицензия? → "Скачать из Steam" (открыть ссылку) или "Скачать нашу версию"
-    Пиратка?  → "Скачать нашу версию" (+ crack позже)
+    → только "Купить/установить в Steam" (владение до установки не проверить —
+      значит и раздавать нечего)
 """
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -36,8 +44,7 @@ class FirstRunDialog(QDialog):
 
     # Варианты решения
     ACTION_PATCH_EXISTING   = "patch"       # патчим найденную копию
-    ACTION_DOWNLOAD_OURS    = "download"    # скачиваем нашу версию (лицензию с сервера)
-    ACTION_PIRATE_DOWNLOAD  = "pirate"      # качаем нашу версию (без лицензии)
+    ACTION_DOWNLOAD_OURS    = "download"    # скачиваем нашу версию (только при is_licensed)
     ACTION_STEAM            = "steam"       # открываем Steam store
     ACTION_CANCEL           = "cancel"
 
@@ -151,12 +158,24 @@ class FirstRunDialog(QDialog):
                 f"Версия: <b>{r.exe_version or '?'}</b> "
                 f"{'✅' if r.version_ok else '❌ (нужна 1.6.1170.0)'}<br>"
                 f"AE DLC: {'✅ все на месте' if r.dlc_ok else f'❌ отсутствует {len(r.missing_dlc)} файлов'}<br>"
-                f"Тип: {'Лицензия' if r.is_licensed else 'Нелицензионная копия'}"
+                f"Тип: {'Лицензия Steam' if r.is_licensed else '⚠️ без Steam-лицензии'}"
             )
             found_info.setWordWrap(True)
             self.options_layout.addWidget(found_info)
 
-            if r.is_ae_complete:
+            if not r.is_licensed:
+                # Найденная копия не проходит проверку лицензии Steam — раздачи
+                # без подтверждённого владения не бывает, см. докстринг файла.
+                self.status_label.setText(
+                    "⚠️ Найденная копия Skyrim не проходит проверку лицензии Steam. "
+                    "Лаунчер работает только с копией, купленной и запускаемой через Steam."
+                )
+                self._add_radio(
+                    self.ACTION_STEAM,
+                    "🎮 Купить/установить Skyrim SE в Steam",
+                    checked=True,
+                )
+            elif r.is_ae_complete:
                 # Идеальный случай — патчим
                 self.status_label.setText(
                     "✅ Skyrim AE найден и готов к патчингу!"
@@ -170,7 +189,7 @@ class FirstRunDialog(QDialog):
                     self.ACTION_DOWNLOAD_OURS,
                     "📥 Скачать нашу версию Skyrim с сервера (заменит найденную)",
                 )
-            elif r.found and not r.version_ok:
+            elif not r.version_ok:
                 # Версия не та
                 self.status_label.setText(
                     f"⚠️ Найден Skyrim, но версия {r.exe_version or '?'} ≠ 1.6.1170.0"
@@ -180,11 +199,10 @@ class FirstRunDialog(QDialog):
                     "📥 Скачать правильную версию Skyrim с нашего сервера",
                     checked=True,
                 )
-                if r.is_licensed:
-                    self._add_radio(
-                        self.ACTION_STEAM,
-                        "🎮 Обновить до 1.6.1170.0 через Steam (нужен аккаунт)",
-                    )
+                self._add_radio(
+                    self.ACTION_STEAM,
+                    "🎮 Обновить до 1.6.1170.0 через Steam",
+                )
             else:
                 # Версия ок но DLC неполные
                 self.status_label.setText(
@@ -195,33 +213,20 @@ class FirstRunDialog(QDialog):
                     "📥 Скачать полную версию с нашего сервера",
                     checked=True,
                 )
-                if r.is_licensed:
-                    self._add_radio(
-                        self.ACTION_STEAM,
-                        "🎮 Установить AE DLC через Steam",
-                    )
-        else:
-            # Не найден
-            self.status_label.setText("❌ Skyrim Special Edition не найден")
-
-            if r.is_licensed:
-                # Лицензия — есть Steam
                 self._add_radio(
                     self.ACTION_STEAM,
-                    "🎮 Скачать Skyrim через Steam (нужен аккаунт с AE)",
-                    checked=True,
+                    "🎮 Установить AE DLC через Steam",
                 )
-                self._add_radio(
-                    self.ACTION_DOWNLOAD_OURS,
-                    "📥 Скачать нашу версию Skyrim с сервера",
-                )
-            else:
-                # Нет лицензии
-                self._add_radio(
-                    self.ACTION_PIRATE_DOWNLOAD,
-                    "📥 Скачать нашу версию Skyrim с сервера",
-                    checked=True,
-                )
+        else:
+            # Не найден — владение Steam подтвердить нечем (проверка лицензии
+            # требует уже установленной копии), поэтому единственный вариант —
+            # отправить в Steam. Раздачи "вслепую" не бывает.
+            self.status_label.setText("❌ Skyrim Special Edition не найден")
+            self._add_radio(
+                self.ACTION_STEAM,
+                "🎮 Купить и установить Skyrim SE в Steam",
+                checked=True,
+            )
 
     def _add_radio(self, action: str, text: str, checked: bool = False):
         rb = QRadioButton(text)
