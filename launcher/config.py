@@ -26,11 +26,19 @@ DAV_BASE_URL  = "https://nethunter.sytes.net/cloud/remote.php/dav/files/SkyrimDo
 DAV_USERNAME  = "SkyrimDownloader"
 DAV_PASSWORD  = os.getenv("TESL_DAV_PASSWORD", _LOCAL_DAV_PASSWORD)
 
-# Пути на сервере (относительно DAV_BASE_URL/1TB/)
-DEPOT_REMOTE_PATH   = "1TB/ModOrganizer"   # основные файлы MO2-сборки
-PATCHER_REMOTE_PATH = "1TB/Patcher"        # файлы патчера
-SKYRIM_REMOTE_PATH  = "1TB/TESV1.6.1170.0" # лицензионная версия Skyrim
-MO2_REMOTE_PATH     = "1TB/MO2p"           # отдельный Mod Organizer
+# Пути на сервере (относительно DAV_BASE_URL).
+# DEPOT_REMOTE_PATH подтверждён живым тестом 2026-09-21 (curl -I на
+# .../1TB/TESS/Instances/TESVAE/versions/v1_20eb01df.db -> 200 OK) — старое
+# значение "1TB/ModOrganizer" было устаревшей заглушкой, из-за которой
+# fetch_depot_index() стабильно бил в несуществующий путь (404 -> None ->
+# "Не удалось загрузить depot.json"). PATCHER_REMOTE_PATH/SKYRIM_REMOTE_PATH/
+# MO2_REMOTE_PATH пока НЕ подтверждены тем же способом — см. CLAUDE.md
+# "Известные несостыковки", не полагаться на патчер/крэш-репортер в проде,
+# пока их тоже не сверят с реальным сервером.
+DEPOT_REMOTE_PATH   = "1TB/TESS/Instances/TESVAE"  # основные файлы MO2-сборки
+PATCHER_REMOTE_PATH = "1TB/Patcher"        # файлы патчера (НЕ подтверждено)
+SKYRIM_REMOTE_PATH  = "1TB/TESV1.6.1170.0" # лицензионная версия Skyrim (НЕ подтверждено)
+MO2_REMOTE_PATH     = "1TB/MO2p"           # отдельный Mod Organizer (НЕ подтверждено)
 
 # depot.json — индекс версий сборки (лежит в DEPOT_REMOTE_PATH)
 DEPOT_JSON_NAME = "depot.json"
