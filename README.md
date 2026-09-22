@@ -45,6 +45,10 @@ cd launcher
 python main.py
 ```
 
+На Windows для повседневного обновления+запуска — `update_and_run.bat` в
+корне репозитория: делает `git pull`, спрашивает пароль WebDAV один раз
+(сохраняет через `setx`, дальше не спрашивает) и запускает `python main.py`.
+
 Нужен пароль WebDAV-аккаунта — либо `set TESL_DAV_PASSWORD=...` перед запуском,
 либо скопируй `launcher/secrets_local.example.py` → `launcher/secrets_local.py`
 и впиши пароль туда (файл в `.gitignore`, в репозиторий не попадёт).
