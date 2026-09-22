@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QMetaObject, Q_ARG, pyqtSlot
@@ -36,7 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR,
+    WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR, LOG_FILE,
     MO2_EXE, MO2_SKSE_ARG, get_asset_path, get_launcher_commit,
 )
 from core.workers import (
@@ -131,6 +132,10 @@ class UpdaterUI(QWidget):
         self._status_button_mode = "install"   # "install" | "update" | "play" — см. _refresh_status_button()
         self._pending_install_target = None    # version_label, который качает текущий install/update-запуск
         self._launcher_commit = get_launcher_commit()  # короткий git-хэш этого чекаута, "?" в собранном .exe
+
+        # Разделитель новой сессии в LOG_FILE — файл иначе копился бы вечно
+        # между запусками, вперемешку, без понятия "что было именно сейчас".
+        self._write_log_file(f"===== new session, launcher {self._launcher_commit} =====")
 
         # ── Config ────────────────────────────────────────────────────────────
         self.data_lock    = threading.Lock()
@@ -971,6 +976,7 @@ class UpdaterUI(QWidget):
     # ── Log helpers ───────────────────────────────────────────────────────────
 
     def _append_log(self, msg: str):
+        self._write_log_file(msg)
         try:
             if self._is_closing:
                 return
@@ -979,6 +985,25 @@ class UpdaterUI(QWidget):
                 Qt.ConnectionType.QueuedConnection,
                 Q_ARG(str, str(msg))
             )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _write_log_file(msg: str):
+        """
+        LOG_FILE (%APPDATA%\\TESVAE_Launcher\\launcher.log) — раньше константа
+        существовала в config.py, но ничего в её не писало: "Показать лог"
+        только переключает видимость лога прямо в окне, файла на диске не
+        было вообще. Добавлено, чтобы можно было прислать содержимое лога
+        уже ПОСЛЕ того как окно закрыто/недоступно для скриншота — тот же
+        повод, что и логирование причины неудачи постера чуть раньше.
+        Best-effort — ошибка записи на диск никогда не должна ломать сам лог
+        в UI, только сама запись молча пропускается.
+        """
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {msg}\n")
         except Exception:
             pass
 

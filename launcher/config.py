@@ -16,6 +16,21 @@ WINDOW_TITLE     = f"Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}"
 APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "TESVAE_Launcher"
 APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Имя текущей сборки — сейчас всегда "TESVAE" (тот же смысл, что и
+# MO2_SHORTCUT_NAME в секции "ModOrganizer" ниже, просто нужен раньше по
+# файлу; если однажды поменяется одно — свериться со вторым). Прямой запрос
+# пользователя, 2026-09-22: контентные кэши (постер/манифест/иконка ярлыка/
+# chunk-манифест — то, что реально принадлежит КОНКРЕТНОЙ сборке) должны
+# жить в своей подпапке, а не вперемешку в одном APPDATA_DIR — когда
+# появится больше одной сборки (см. CLAUDE.md/README "Мультисборочность",
+# план, ещё не начат), у каждой будут свои постер/манифест/etc., и без
+# такого разделения кэш одной сборки перетирал бы кэш другой. Настройки
+# самого лаунчера (CONFIG_FILE/PROGRESS_FILE/LOG_FILE/DAV_PASSWORD_CACHE_FILE
+# выше) — общие для всех сборок, специально остаются в APPDATA_DIR напрямую.
+BUILD_NAME     = "TESVAE"
+BUILD_DATA_DIR = APPDATA_DIR / BUILD_NAME
+BUILD_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # ── WebDAV ────────────────────────────────────────────────────────────────────
 # Базовый URL WebDAV (Nextcloud). Учётка read-only, общая для всех клиентов —
 # любой, кто соберёт .exe, может её извлечь (это ожидаемо для этой архитектуры,
@@ -89,16 +104,19 @@ JSON_SERVER = "https://nethunter.sytes.net/sky/"
 # ── Crash logger ──────────────────────────────────────────────────────────────
 CRASH_LOG_REMOTE_PATH = "1TB/CrashLogs"   # куда шлём репорты (тот же WebDAV)
 
-# ── Остальные локальные пути (APPDATA_DIR сам определён в самом верху файла) ──
+# ── Настройки лаунчера — общие для всех сборок, прямо в APPDATA_DIR ───────────
 CONFIG_FILE      = APPDATA_DIR / "config.json"
 PROGRESS_FILE    = APPDATA_DIR / "progress.json"
 LOG_FILE         = APPDATA_DIR / "launcher.log"
-MANIFEST_CACHE   = APPDATA_DIR / "manifest.json"   # кэш манифеста с сервера
-POSTER_CACHE     = APPDATA_DIR / "poster.png"
-MANIFEST_CHUNK_DB_CACHE = APPDATA_DIR / "manifest_chunk_cache.db"   # см. CHUNK_DIR выше
+
+# ── Контент конкретной сборки — под BUILD_DATA_DIR (см. её собственный
+# комментарий выше про мультисборочность) ──────────────────────────────────────
+MANIFEST_CACHE   = BUILD_DATA_DIR / "manifest.json"   # кэш манифеста с сервера
+POSTER_CACHE     = BUILD_DATA_DIR / "poster.png"
+MANIFEST_CHUNK_DB_CACHE = BUILD_DATA_DIR / "manifest_chunk_cache.db"   # см. CHUNK_DIR выше
 # .lnk-ярлык ссылается на иконку ФАЙЛОМ на диске (не встроенными байтами) —
 # поэтому иконку ярлыка нужно один раз сохранить локально, не только скачать.
-SHORTCUT_ICON_CACHE = APPDATA_DIR / "shortcut_icon.ico"
+SHORTCUT_ICON_CACHE = BUILD_DATA_DIR / "shortcut_icon.ico"
 
 # ── Skyrim AE ─────────────────────────────────────────────────────────────────
 SKYRIM_TARGET_VERSION = "1.6.1170.0"
