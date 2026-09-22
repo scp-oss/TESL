@@ -4,13 +4,18 @@ cd /d "%~dp0"
 echo === TESL: update from git + launch ===
 echo.
 
-git pull
+rem Hard-sync to origin/main instead of `git pull` - guarantees this is
+rem EXACTLY what's on GitHub, no ambiguity from fast-forward/errorlevel
+rem quirks. This discards any local changes to tracked files (not
+rem untracked ones like launcher/secrets_local.py) - fine for a checkout
+rem that's only ever meant to run the app, not to develop on.
+git fetch origin main
+git reset --hard origin/main
 
-rem Not gating on errorlevel here: git pull's exit code has been observed
-rem to occasionally be nonzero even on a successful fast-forward (a known
-rem quirk on some Windows git installs, e.g. pager-related). The pull's
-rem own output above is the real signal - if it printed "error:"/"fatal:",
-rem something's actually wrong; otherwise just proceed.
+echo.
+echo Now running commit:
+git log -1 --oneline
+echo.
 
 cd launcher
 
