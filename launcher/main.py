@@ -11,6 +11,7 @@ from PyQt6.QtGui import QIcon
 
 import config
 from config import get_asset_path
+from ui.carousel_window import CarouselWindow
 from ui.main_window import UpdaterUI
 
 
@@ -45,7 +46,38 @@ def _ensure_dav_password():
         pass  # не критично — просто спросит ещё раз в следующий запуск
 
 
+# Держим ссылки на окна на уровне модуля, а не в локальных переменных
+# main() — та же ловушка PyQt6, что уже чинилась несколько раз в этом
+# сеансе (ui/main_window.py::_start_poster_loader/_send_crash_report):
+# окно без живой Python-ссылки, только видимое через show(), рискует быть
+# собрано сборщиком мусора, особенно при переходе carousel -> main-окно
+# внутри одного колбэка, где локальная переменная carousel вот-вот выйдет
+# из области видимости.
+_carousel_window = None
+_main_window      = None
+
+
+def _open_main_window(build):
+    """
+    Колбэк карусели (см. ui/carousel_window.py::CarouselWindow) — выбрана
+    сборка, переключаем на неё config.py (см. config.activate_build()'s
+    докстрин про "живьём, не через `from config import X`") и открываем
+    главное окно для неё же.
+    """
+    global _carousel_window, _main_window
+    config.activate_build(build)
+
+    _main_window = UpdaterUI()
+    _main_window.show()
+
+    if _carousel_window:
+        _carousel_window.close()
+        _carousel_window = None
+
+
 def main():
+    global _carousel_window
+
     app = QApplication(sys.argv)
     app.setApplicationName("TESVAE Launcher")
     app.setStyle("Fusion")
@@ -56,8 +88,12 @@ def main():
 
     _ensure_dav_password()
 
-    window = UpdaterUI()
-    window.show()
+    # Карусель сборок — прямой запрос пользователя 2026-09-22 ("теперь пусть
+    # будет при запуске карусель со сборками"). Показывается ВСЕГДА, даже
+    # когда реально существует только одна сборка (см. core/builds.py) — на
+    # клик по единственной плитке сразу открывается главное окно для неё.
+    _carousel_window = CarouselWindow(on_build_selected=_open_main_window)
+    _carousel_window.show()
 
     sys.exit(app.exec())
 

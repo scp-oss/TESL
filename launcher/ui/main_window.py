@@ -2,17 +2,23 @@
 """
 Главное окно лаунчера.
 
-Макет (760×480):
+Перед этим окном открывается ui/carousel_window.py::CarouselWindow — экран
+выбора сборки (карусель плиток). Это окно открывается ПОСЛЕ выбора плитки,
+уже для конкретной сборки (config.activate_build(), см. main.py).
+
+Макет (780×500) — левая колонка "инструментов" (патч/проверка/очистка)
+переехала в диалог настроек (⚙, см. _open_settings()/ui/settings_dialog.py,
+прямой запрос пользователя 2026-09-22):
   ┌─────────────────────────────────────────────────────────────┐
-  │ [📁 папка]  [🏷 ярлык]  [🔄 Explorer]    Версия: ...  [🌙] │
-  ├──────────────┬──────────────────────┬────────────────────────┤
-  │ Left 200px   │ Center (постер 300×) │ Right 240px            │
-  │ Пропатчить   │       poster.png     │ Выберите версию:       │
-  │ Проверить    │                      │ [combo]                │
-  │ Очистить     │  [▶ Запустить TESVAE]│ [Последняя]            │
-  │              │                      │ [Обновить]             │
-  │              │                      │ [Откат]                │
-  ├──────────────┴──────────────────────┴────────────────────────┤
+  │ [📁 папка]  [🏷 ярлык]          Версия: ...      [⚙] [🌙] │
+  ├────────────────────────────────┬──────────────────────────────┤
+  │ Center (постер, шире)          │ Right 230px                  │
+  │       poster.png               │ Выберите версию:             │
+  │                                 │ [combo]                      │
+  │ [▶ / 📥 / ⬆ / ⏹  TESVAE]      │ [Последняя]                  │
+  │  (умная кнопка статуса)        │ [Обновить]                   │
+  │                                 │ [Откат]                      │
+  ├─────────────────────────────────┴──────────────────────────────┤
   │ [████████████████████████████████████] Пауза                 │
   ├─────────────────────────────────────────────────────────────┤
   │ [лог]                             Информация о версии        │
@@ -37,7 +43,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR, LOG_FILE,
+    WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR,
     MO2_EXE, MO2_SKSE_ARG, get_asset_path, get_launcher_commit,
 )
 from core.workers import (
@@ -46,6 +52,8 @@ from core.workers import (
 )
 from core.patcher import SkyrimPatcher, MO2Configurator
 from core.depot_client import DepotClient
+from core.debug_log import maybe_upload_debug_log
+from ui.settings_dialog import SettingsDialog
 
 try:
     import winreg as _winreg
@@ -200,12 +208,16 @@ class UpdaterUI(QWidget):
         self.lbl_shortcut.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.lbl_shortcut.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        self.lbl_explorer = QLabel("🔄 Перезапустить Explorer")
-        self.lbl_explorer.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_explorer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
         self.lbl_version = QLabel(self._format_version_label("не установлена"))
         self.lbl_version.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        # "🔄 Перезапустить Explorer" переехал в диалог настроек (см.
+        # _open_settings()/ui/settings_dialog.py) — сама кнопка теперь
+        # создаётся там, _restart_explorer() как метод остался прежним.
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setFixedSize(32, 32)
+        self.btn_settings.setToolTip("Настройки")
+        self.btn_settings.clicked.connect(self._open_settings)
 
         self.btn_theme = QPushButton("🌙")
         self.btn_theme.setFixedSize(32, 32)
@@ -213,9 +225,9 @@ class UpdaterUI(QWidget):
 
         top.addWidget(self.lbl_folder)
         top.addWidget(self.lbl_shortcut)
-        top.addWidget(self.lbl_explorer)
         top.addStretch()
         top.addWidget(self.lbl_version)
+        top.addWidget(self.btn_settings)
         top.addWidget(self.btn_theme)
         main_v.addLayout(top)
 
@@ -223,26 +235,30 @@ class UpdaterUI(QWidget):
         content = QHBoxLayout()
         content.setSpacing(10)
 
-        # Left panel
-        left = QFrame()
-        left.setFixedWidth(190)
-        lv = QVBoxLayout(left)
-        lv.setSpacing(6)
+        # "Инструменты" (патч/проверка файлов/очистка Skyrim) переехали в
+        # диалог настроек (см. _open_settings()/ui/settings_dialog.py) —
+        # прямой запрос пользователя 2026-09-22 ("уберем все тулсы не
+        # тулсы... в настройки"). Кнопки создаются здесь как раньше (нужны
+        # main_window.py::ALL_BTNS/_disable_buttons() для блокировки во
+        # время параллельных операций), просто НЕ добавляются ни в один
+        # layout этого окна — SettingsDialog берёт готовые виджеты и
+        # добавляет их в свой layout (см. её докстринг про реродительство).
+        # Левой колонки с фиксированной шириной больше нет — освободившееся
+        # место отдано постеру/центральной колонке (было 310, стало шире).
+        self.btn_patch  = QPushButton("🔨 Пропатчить Skyrim")
+        self.btn_verify = QPushButton("🛠 Проверить файлы")
+        self.btn_revert = QPushButton("♻️ Очистить Skyrim")
+        self.settings_dialog = None   # создаётся лениво, один раз — см. _open_settings()
 
-        self.btn_patch   = QPushButton("🔨 Пропатчить Skyrim")
-        self.btn_verify  = QPushButton("🛠 Проверить файлы")
-        self.btn_install = QPushButton("📥 Установить")
-        self.btn_revert  = QPushButton("♻️ Очистить Skyrim")
-
-        for b in (self.btn_patch, self.btn_verify, self.btn_install, self.btn_revert):
-            b.setFixedHeight(36)
-            lv.addWidget(b)
-        lv.addStretch()
-        content.addWidget(left)
+        # Растяжка слева от центра — без своей левой колонки (190px) центр+
+        # правая панель (340+230+10=580) уже не заполняют всю ширину окна
+        # (780) сами по себе; без stretch'ей блок прижимался бы к левому
+        # краю с некрасивой пустотой справа — с ними он по центру.
+        content.addStretch(1)
 
         # Center panel — постер + кнопка запуска
         center = QFrame()
-        center.setFixedWidth(310)
+        center.setFixedWidth(340)
         cv = QVBoxLayout(center)
         cv.setContentsMargins(0, 0, 0, 0)
         cv.setSpacing(6)
@@ -287,6 +303,7 @@ class UpdaterUI(QWidget):
         rv.addWidget(self.lbl_version_info)
 
         content.addWidget(right)
+        content.addStretch(1)
         main_v.addLayout(content)
 
         # ── Progress bar ──────────────────────────────────────────────────────
@@ -340,9 +357,7 @@ class UpdaterUI(QWidget):
     def _connect_signals(self):
         self.lbl_folder.mousePressEvent   = lambda _: self._choose_folder()
         self.lbl_shortcut.mousePressEvent = lambda _: self._create_shortcut()
-        self.lbl_explorer.mousePressEvent = lambda _: self._restart_explorer()
 
-        self.btn_install.clicked.connect(self._install)
         self.btn_launch.clicked.connect(self._on_status_button_clicked)
         self.btn_patch.clicked.connect(self._patch_skyrim)
         self.btn_verify.clicked.connect(self._verify_files)
@@ -523,7 +538,7 @@ class UpdaterUI(QWidget):
         if self.is_installing:
             self._stop_worker()
             self.is_installing = False
-            self.btn_install.setText("📥 Установить")
+            self._refresh_status_button()   # is_installing уже False -> пересчитает install/update/play заново
             self._enable_buttons()
             return
 
@@ -533,8 +548,8 @@ class UpdaterUI(QWidget):
                 return
 
         self.is_installing = True
-        self.btn_install.setText("⏹ Отменить")
-        self._disable_buttons(exclude=[self.btn_install])
+        self._set_status_button("cancel")
+        self._disable_buttons(exclude=[self.btn_launch])
 
         version = self.combo_versions.currentText()
         if version in ("Загрузка...", "Нет доступных версий"):
@@ -607,6 +622,8 @@ class UpdaterUI(QWidget):
         else:
             self._append_log("Проверка прервана")
 
+        self._maybe_upload_debug_log("verify")
+
     # ── Patch / Revert ────────────────────────────────────────────────────────
 
     def _start_patcher(self, method: str, done_signal_name: str, btn, btn_text_orig: str, op_name: str):
@@ -659,6 +676,7 @@ class UpdaterUI(QWidget):
         self.progress.setValue(0)
         self.progress.setFormat("")
         self._append_log("✅ Завершено" if ok else "❌ Завершено с ошибками")
+        self._maybe_upload_debug_log("patch")
 
     # ── Launch ────────────────────────────────────────────────────────────────
 
@@ -694,7 +712,18 @@ class UpdaterUI(QWidget):
         Вызывается при любом событии, способном поменять эту картину: выбор
         папки, загрузка списка версий, смена версии в комбобоксе, завершение
         установки/обновления.
+
+        Во время активной установки (self.is_installing) НИЧЕГО не
+        пересчитывает — кнопка должна оставаться "⏹ Отменить" (режим
+        "cancel", выставленный явно в _install()) независимо от того, что
+        пользователь мог успеть покрутить в комбобоксе версий, пока
+        качается (combo_versions не блокируется во время install — не в
+        ALL_BTNS); без этой ранней остановки смена версии в комбобоксе
+        подменила бы подпись кнопки на "Обновить"/"Установить" прямо
+        поверх идущей загрузки, хотя сама установка продолжала бы идти.
         """
+        if self.is_installing:
+            return
         mo_exe = Path(self._full_local_path) / MO2_EXE if self._full_local_path else None
         if not mo_exe or not mo_exe.exists():
             self._set_status_button("install")
@@ -711,16 +740,23 @@ class UpdaterUI(QWidget):
             self._set_status_button("play")
 
     def _set_status_button(self, mode: str):
+        """mode: "install" | "update" | "play" | "cancel". "cancel" — во
+        время активной установки (см. _install()) — раньше это была
+        отдельная кнопка btn_install слева ("📥 Установить" <-> "⏹
+        Отменить"); та колонка переехала в настройки (см. _open_settings()),
+        а её роль install/cancel полностью взяла на себя эта кнопка."""
         self._status_button_mode = mode
         if mode == "install":
             self.btn_launch.setText("📥  Установить")
         elif mode == "update":
             self.btn_launch.setText("⬆  Обновить")
+        elif mode == "cancel":
+            self.btn_launch.setText("⏹  Отменить")
         else:
             self.btn_launch.setText("▶  Играть")
 
     def _on_status_button_clicked(self):
-        if self._status_button_mode in ("install", "update"):
+        if self._status_button_mode in ("install", "update", "cancel"):
             self._install()
         else:
             self._launch_game()
@@ -776,7 +812,7 @@ class UpdaterUI(QWidget):
 
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("⏸ Пауза")
-        self._disable_buttons(exclude=[self.btn_install, self.btn_pause])
+        self._disable_buttons(exclude=[self.btn_launch, self.btn_pause])
 
     def _on_worker_finished(self, ok: bool):
         if self._is_closing:
@@ -797,7 +833,12 @@ class UpdaterUI(QWidget):
 
         if self.is_installing:
             self.is_installing = False
-            self.btn_install.setText("📥 Установить")
+            # Кнопка статуса уже пересчитана выше (_refresh_status_button()) —
+            # раньше здесь стояло self.btn_install.setText("📥 Установить"),
+            # безусловно откатывая подпись на "Установить" независимо от
+            # реального состояния; своя колонка с этой кнопкой убрана (см.
+            # _open_settings()), и её текст теперь всегда только через
+            # _set_status_button()/_refresh_status_button().
             self._enable_buttons()
             if ok:
                 self._append_log("✅ Установка завершена")
@@ -807,6 +848,8 @@ class UpdaterUI(QWidget):
         else:
             self._enable_buttons()
             self._append_log("✅ Готово" if ok else "❌ Завершено с ошибками")
+
+        self._maybe_upload_debug_log("install")
 
     def _post_install_configure(self):
         """После установки: обновляем INI + создаём ярлык."""
@@ -885,7 +928,7 @@ class UpdaterUI(QWidget):
     # ── Button state helpers ──────────────────────────────────────────────────
 
     ALL_BTNS = property(lambda self: [
-        self.btn_install, self.btn_launch, self.btn_patch,
+        self.btn_launch, self.btn_patch,
         self.btn_verify, self.btn_revert, self.btn_latest,
         self.btn_update, self.btn_rollback,
     ])
@@ -917,6 +960,53 @@ class UpdaterUI(QWidget):
             self._full_local_path, log=self._append_log, icon_path=icon_path, arg=arg,
         )
         self._append_log(msg)
+
+    # ── Settings dialog ───────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        """
+        Открывает диалог настроек (прямой запрос пользователя 2026-09-22) —
+        создаётся ОДИН РАЗ (не при каждом клике): диалог реродительствует
+        уже существующие self.btn_patch/self.btn_verify/self.btn_revert в
+        свой layout, и повторное создание диалога заново реродительствовало
+        бы их снова без вреда, но проще и дешевле просто переиспользовать
+        один и тот же объект — см. SettingsDialog.__init__ докстринг.
+        """
+        if self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(
+                self,
+                self.btn_patch, self.btn_verify, self.btn_revert,
+                restart_explorer_fn=self._restart_explorer,
+                debug_mode_getter=self._get_debug_mode,
+                debug_mode_setter=self._set_debug_mode,
+            )
+        self.settings_dialog.exec()
+
+    def _get_debug_mode(self) -> bool:
+        return bool(self.config.get("debug_mode", False))
+
+    def _set_debug_mode(self, enabled: bool):
+        self.config["debug_mode"] = bool(enabled)
+        self._save_config()
+        self._append_log(
+            "🐞 Режим отладки включён — лог будет отправляться на сервер"
+            if enabled else "Режим отладки выключен"
+        )
+
+    def _maybe_upload_debug_log(self, reason: str):
+        """
+        Если включён режим отладки — фоново, best-effort отправляет
+        LOG_FILE на сервер (core/debug_log.py, тот же WebDAV-механизм, что
+        и у крэш-репортов). Вызывается после установки/проверки/патчинга и
+        при закрытии окна (см. closeEvent) — НЕ блокирует UI (отдельный
+        поток-демон, не QThread: приложение может закрываться прямо во
+        время отправки, и это не должно держать процесс живым дольше, чем
+        нужно — daemon-поток убивается вместе с процессом без вопросов).
+        """
+        if not self._get_debug_mode():
+            return
+        username = self.config.get("username", "") or "unknown_user"
+        maybe_upload_debug_log(username, reason, log=self._append_log)
 
     def _restart_explorer(self):
         if os.name != "nt":
@@ -1006,22 +1096,13 @@ class UpdaterUI(QWidget):
 
     @staticmethod
     def _write_log_file(msg: str):
-        """
-        LOG_FILE (%APPDATA%\\TESVAE_Launcher\\launcher.log) — раньше константа
-        существовала в config.py, но ничего в её не писало: "Показать лог"
-        только переключает видимость лога прямо в окне, файла на диске не
-        было вообще. Добавлено, чтобы можно было прислать содержимое лога
-        уже ПОСЛЕ того как окно закрыто/недоступно для скриншота — тот же
-        повод, что и логирование причины неудачи постера чуть раньше.
-        Best-effort — ошибка записи на диск никогда не должна ломать сам лог
-        в UI, только сама запись молча пропускается.
-        """
-        try:
-            ts = datetime.now().strftime("%H:%M:%S")
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(f"[{ts}] {msg}\n")
-        except Exception:
-            pass
+        """Дописывает в LOG_FILE — теперь общая config.write_log_file()
+        (см. её докстринг: вынесена туда, когда появился второй вызывающий,
+        ui/carousel_window.py, показывается ДО этого окна). Метод здесь
+        оставлен как тонкая обёртка — вызывающий код внутри этого класса не
+        трогали, чтобы не раздувать этот и без того большой diff."""
+        import config as _config
+        _config.write_log_file(msg)
 
     @pyqtSlot(str)
     def _safe_append_log(self, text: str):
@@ -1104,6 +1185,7 @@ class UpdaterUI(QWidget):
 
     def closeEvent(self, event):
         self._is_closing = True
+        self._maybe_upload_debug_log("close")
         for attr in ("worker", "verify_worker", "patcher_worker"):
             w = getattr(self, attr, None)
             if w:

@@ -23,12 +23,21 @@ from urllib.parse import quote
 import requests
 from requests.auth import HTTPBasicAuth
 
-import config as _config   # для DAV_PASSWORD — см. комментарий на __init__
+# import config as _config — для значений, которые config.activate_build()
+# может поменять ЖИВЬЁМ после импорта этого модуля (DEPOT_REMOTE_PATH,
+# DAV_PASSWORD, MANIFEST_CACHE/POSTER_CACHE/SHORTCUT_ICON_CACHE). Та же
+# ловушка, что уже чинилась в этом сеансе для DAV_PASSWORD (см. CLAUDE.md) —
+# `from config import X` замораживает X на момент импорта модуля, а не
+# читает его заново при каждом вызове. Константы НИЖЕ, которые
+# activate_build() не трогает (одинаковые для всех сборок структурно —
+# сам протокол, а не то, ГДЕ он развёрнут), по-прежнему импортируются по
+# имени напрямую — это безопасно, они не меняются во время работы процесса.
+import config as _config
 from config import (
     DAV_BASE_URL, DAV_USERNAME,
-    DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, BUILD_ASSETS_SUBDIR,
+    DEPOT_JSON_NAME, BUILD_ASSETS_SUBDIR,
     POSTER_FILENAME, SHORTCUT_ICON_FILENAME, SHORTCUT_ARG_FILENAME,
-    MANIFEST_CACHE, POSTER_CACHE, SHORTCUT_ICON_CACHE, CHUNK_DIR,
+    CHUNK_DIR, BUILDS_REGISTRY_PATH,
 )
 
 
@@ -51,11 +60,20 @@ class DepotClient:
         server_url:  str = DAV_BASE_URL,
         username:    str = DAV_USERNAME,
         password:    Optional[str] = None,
-        remote_path: str = DEPOT_REMOTE_PATH,
+        remote_path: Optional[str] = None,
         verify_ssl:  bool = True,
     ):
         self.base        = server_url.rstrip("/")
-        self.remote_path = remote_path.strip("/")
+        # remote_path=None -> config.DEPOT_REMOTE_PATH ЖИВЬЁМ, на момент
+        # вызова __init__, не на момент импорта модуля (раньше было
+        # `remote_path: str = DEPOT_REMOTE_PATH` — значение по умолчанию у
+        # функции вычисляется ОДИН РАЗ при определении функции, то есть при
+        # первом импорте этого файла; после config.activate_build() при
+        # переключении сборки в карусели все последующие `DepotClient()` без
+        # явного remote_path продолжали бы бить в старую сборку). Тот же
+        # класс бага, что уже чинился для DAV_PASSWORD.
+        effective_remote_path = remote_path if remote_path is not None else _config.DEPOT_REMOTE_PATH
+        self.remote_path = effective_remote_path.strip("/")
         self.session     = requests.Session()
         # password=None -> берём config.DAV_PASSWORD ЖИВЬЁМ, на момент вызова,
         # не на момент импорта этого модуля. `from config import DAV_PASSWORD`
@@ -166,9 +184,10 @@ class DepotClient:
         return None
 
     def cache_manifest(self, manifest: dict):
-        """Сохраняем манифест локально."""
+        """Сохраняем манифест локально (путь — _config.MANIFEST_CACHE живьём,
+        см. комментарий на импортах в начале файла — меняется activate_build())."""
         try:
-            MANIFEST_CACHE.write_text(
+            _config.MANIFEST_CACHE.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
@@ -178,8 +197,8 @@ class DepotClient:
     def load_cached_manifest(self) -> Optional[dict]:
         """Читаем кэшированный манифест."""
         try:
-            if MANIFEST_CACHE.exists():
-                return json.loads(MANIFEST_CACHE.read_text(encoding="utf-8"))
+            if _config.MANIFEST_CACHE.exists():
+                return json.loads(_config.MANIFEST_CACHE.read_text(encoding="utf-8"))
         except Exception:
             pass
         return None
@@ -231,7 +250,7 @@ class DepotClient:
         try:
             r = self.session.get(url, timeout=20)
             if r.status_code == 200:
-                POSTER_CACHE.write_bytes(r.content)
+                _config.POSTER_CACHE.write_bytes(r.content)
                 if on_log:
                     on_log(f"Постер загружен ({len(r.content)} байт): {url}")
                 return r.content
@@ -241,10 +260,10 @@ class DepotClient:
             if on_log:
                 on_log(f"Постер: ошибка запроса {url} — {e}")
         # Fallback на кэш
-        if POSTER_CACHE.exists():
+        if _config.POSTER_CACHE.exists():
             if on_log:
-                on_log(f"Постер: беру из локального кэша ({POSTER_CACHE})")
-            return POSTER_CACHE.read_bytes()
+                on_log(f"Постер: беру из локального кэша ({_config.POSTER_CACHE})")
+            return _config.POSTER_CACHE.read_bytes()
         return None
 
     # ── Иконка/аргумент ярлыка (<remote_path>/src/, подтверждено 2026-09-21) ───
@@ -258,12 +277,12 @@ class DepotClient:
         try:
             r = self.session.get(self._url(BUILD_ASSETS_SUBDIR, SHORTCUT_ICON_FILENAME), timeout=20)
             if r.status_code == 200:
-                SHORTCUT_ICON_CACHE.write_bytes(r.content)
-                return SHORTCUT_ICON_CACHE
+                _config.SHORTCUT_ICON_CACHE.write_bytes(r.content)
+                return _config.SHORTCUT_ICON_CACHE
         except Exception:
             pass
-        if SHORTCUT_ICON_CACHE.exists():
-            return SHORTCUT_ICON_CACHE
+        if _config.SHORTCUT_ICON_CACHE.exists():
+            return _config.SHORTCUT_ICON_CACHE
         return None
 
     def fetch_shortcut_arg(self) -> Optional[dict]:
@@ -415,6 +434,72 @@ class DepotClient:
 
     def close(self):
         self.session.close()
+
+
+def fetch_poster_bytes(remote_path: str, on_log=None) -> Optional[bytes]:
+    """
+    Скачивает постер КОНКРЕТНОЙ сборки по её remote_path — для карусели,
+    которая показывает миниатюры ВСЕХ сборок сразу, до того как какая-либо
+    из них станет "активной" через config.activate_build(). Намеренно НЕ
+    переиспользует DepotClient.fetch_poster()/_config.POSTER_CACHE — та
+    кэширует на диск и читает fallback-кэш только текущей активной сборки;
+    вызов её для чужой сборки перепутал бы кэши между собой. Здесь кэша на
+    диск нет вообще — карусель недолговечна, каждый показ качает миниатюры
+    заново; если станет проблемой при большом числе сборок — отдельная
+    доработка (кэш по build.name), не сейчас.
+    """
+    base = DAV_BASE_URL.rstrip("/")
+    rp   = remote_path.strip("/")
+    url  = f"{base}/{rp}/{BUILD_ASSETS_SUBDIR}/{POSTER_FILENAME}"
+    try:
+        session = requests.Session()
+        session.auth = HTTPBasicAuth(DAV_USERNAME, _config.DAV_PASSWORD)
+        r = session.get(url, timeout=20)
+        session.close()
+        if r.status_code == 200:
+            return r.content
+        if on_log:
+            on_log(f"Постер сборки: HTTP {r.status_code} на {url}")
+    except Exception as e:
+        if on_log:
+            on_log(f"Постер сборки: ошибка запроса {url} — {e}")
+    return None
+
+
+def fetch_builds_registry(on_log=None) -> Optional[list]:
+    """
+    Скачивает реестр доступных сборок для карусели —
+    <DAV_BASE_URL>/<config.BUILDS_REGISTRY_PATH>, ожидаемый JSON-массив
+    [{"name": "...", "label": "...", "remote_path": "..."}, ...].
+
+    НЕ существование этого файла на сервере СЕЙЧАС ещё не подтверждено —
+    см. BUILDS_REGISTRY_PATH в config.py. HTTP 404/любая ошибка сети —
+    ШТАТНЫЙ, ожидаемый исход, а не сбой: вызывающий код
+    (core/builds.py::list_builds()) в этом случае откатывается на
+    единственную сборку, зашитую в config.py напрямую (DEPOT_REMOTE_PATH/
+    BUILD_NAME), так что карусель работает уже сегодня с одной плиткой.
+    Отдельная короткоживущая requests.Session — вне remote_path какой-либо
+    конкретной сборки, реестр лежит на уровень выше.
+    """
+    url = f"{DAV_BASE_URL.rstrip('/')}/{BUILDS_REGISTRY_PATH.strip('/')}"
+    try:
+        session = requests.Session()
+        session.auth = HTTPBasicAuth(DAV_USERNAME, _config.DAV_PASSWORD)
+        r = session.get(url, timeout=15)
+        session.close()
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                return data
+            if on_log:
+                on_log(f"Реестр сборок: неожиданный формат (не список JSON) — {url}")
+            return None
+        if on_log:
+            on_log(f"Реестр сборок: HTTP {r.status_code} на {url} (ещё не выложен — используем текущую сборку)")
+    except Exception as e:
+        if on_log:
+            on_log(f"Реестр сборок недоступен: {e} (используем текущую сборку)")
+    return None
 
 
 def _sha256(path: Path) -> str:

@@ -15,10 +15,8 @@ from urllib.parse import quote
 import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from config import (
-    MAX_WORKERS, CHUNK_MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME,
-    DEPOT_REMOTE_PATH, MANIFEST_CACHE, MANIFEST_CHUNK_DB_CACHE,
-)
+import config as _config   # для MANIFEST_CHUNK_DB_CACHE — см. комментарий ниже
+from config import MAX_WORKERS, CHUNK_MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME
 from core.depot_client import DepotClient, _sha256
 from core.chunk_manifest_db import read_manifest_db
 from core.chunk_installer import ChunkInstaller
@@ -305,9 +303,14 @@ class DownloadWorker(ThreadSafeWorker):
 
         self.log.emit("📦 Обнаружен chunk-манифест — устанавливаем напрямую из chunks/ на сервере")
         try:
-            MANIFEST_CHUNK_DB_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            MANIFEST_CHUNK_DB_CACHE.write_bytes(db_bytes)
-            entries, meta = read_manifest_db(MANIFEST_CHUNK_DB_CACHE)
+            # _config.MANIFEST_CHUNK_DB_CACHE живьём, не через `from config
+            # import MANIFEST_CHUNK_DB_CACHE` — та заморозила бы путь на
+            # момент импорта этого модуля, раньше переключения сборки в
+            # карусели через config.activate_build() (см. её докстринг).
+            cache_path = _config.MANIFEST_CHUNK_DB_CACHE
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(db_bytes)
+            entries, meta = read_manifest_db(cache_path)
         except Exception as e:
             self.log.emit(f"❌ Не удалось прочитать chunk-манифест: {e}")
             return False
@@ -469,6 +472,39 @@ class PosterLoader(ThreadSafeWorker):
         except Exception as e:
             self.log.emit(f"Постер: неожиданная ошибка — {e}")
             self.failed.emit()
+
+
+# ── Builds loader (карусель) ──────────────────────────────────────────────────
+
+class BuildsLoaderWorker(ThreadSafeWorker):
+    """
+    Загружает список сборок для карусели на старте (core/builds.py) и
+    постер-миниатюру для каждой — в фоне, чтобы карусель не подвисала на
+    сетевых запросах. loaded emit'ится один раз со всем списком (карусель
+    сразу рисует плитки с текстом), poster_loaded — по одной на сборку,
+    по мере скачивания (та же логика "показывай что уже готово", что и у
+    funnel-результатов в z0r-panel, только тут это постеры, а не стратегии).
+    """
+    log           = pyqtSignal(str)
+    loaded        = pyqtSignal(list)         # List[core.builds.Build]
+    poster_loaded = pyqtSignal(str, bytes)   # build.name, poster bytes
+
+    def run(self):
+        from core.builds import list_builds
+        from core.depot_client import fetch_poster_bytes
+        try:
+            builds = list_builds(log=self.log.emit)
+        except Exception as e:
+            self.log.emit(f"Ошибка загрузки списка сборок: {e}")
+            builds = []
+        self.loaded.emit(builds)
+
+        for b in builds:
+            if self._should_stop():
+                return
+            data = fetch_poster_bytes(b.remote_path, on_log=self.log.emit)
+            if data:
+                self.poster_loaded.emit(b.name, data)
 
 
 # ── Skyrim check worker ───────────────────────────────────────────────────────

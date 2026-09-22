@@ -72,6 +72,19 @@ PATCHER_REMOTE_PATH = "1TB/Patcher"        # файлы патчера (НЕ п�
 SKYRIM_REMOTE_PATH  = "1TB/TESV1.6.1170.0" # лицензионная версия Skyrim (НЕ подтверждено)
 MO2_REMOTE_PATH     = "1TB/MO2p"           # отдельный Mod Organizer (НЕ подтверждено)
 
+# Реестр доступных сборок для карусели на старте (см. ui/carousel_window.py,
+# core/builds.py) — [{"name","label","remote_path",...}, ...] в JSON, лежит
+# на уровень выше DEPOT_REMOTE_PATH (рядом с TESVAE, а не внутри неё).
+# НЕ ПОДТВЕРЖДЕНО существование такого файла на реальном сервере — тот же
+# класс "путь ещё не сверен с реальным листингом", что раньше был у
+# DEPOT_REMOTE_PATH/CRASH_LOG_REMOTE_PATH до их подтверждения (см. CLAUDE.md).
+# depot_client.py::fetch_builds_registry() трактует 404/любую ошибку как
+# штатный случай (реестр ещё не выложен) и откатывается на единственную
+# сборку, зашитую константами этого файла — карусель поэтому работает уже
+# сегодня, с одной плиткой, и подхватит реальный список сам, как только
+# builds.json появится на сервере по этому пути.
+BUILDS_REGISTRY_PATH = "1TB/TESS/Instances/builds.json"
+
 # depot.json — индекс версий сборки (лежит в DEPOT_REMOTE_PATH)
 DEPOT_JSON_NAME = "depot.json"
 
@@ -110,6 +123,16 @@ JSON_SERVER = "https://nethunter.sytes.net/sky/"
 # <CRASH_LOG_REMOTE_PATH>/<username>/<ММ.ДД.ГГГГ-ЧЧ.ММ.СС>/ — уже совпадает
 # с реальным примером, чинить нужно было только сам путь.
 CRASH_LOG_REMOTE_PATH = "1TB/TESS/Staticfolders/CRASH_Log"
+
+# ── Debug-режим (настройки -> "Режим отладки") ────────────────────────────────
+# Прямой запрос пользователя 2026-09-22: если включено, весь лог консоли
+# лаунчера (LOG_FILE, см. блок ниже) отправляется на сервер тем же
+# WebDAV-механизмом, что и крэш-репорты (core/crash_logger.py::upload_files(),
+# уже проверенный и подтверждённый в этом сеансе выше). ПУТЬ НЕ ПОДТВЕРЖДЁН —
+# по аналогии с CRASH_LOG_REMOTE_PATH, соседняя папка того же
+# "Staticfolders" — сверить с реальным листингом, когда появится первая
+# реальная отправка, тем же способом, каким сверяли путь крэш-логов.
+DEBUG_LOG_REMOTE_PATH = "1TB/TESS/Staticfolders/DEBUG_Log"
 
 # ── Настройки лаунчера — общие для всех сборок, прямо в APPDATA_DIR ───────────
 CONFIG_FILE      = APPDATA_DIR / "config.json"
@@ -208,6 +231,66 @@ def get_asset_path(name: str) -> Path:
     """Путь к bundled-ассету (работает и в .py и в PyInstaller exe)"""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     return base / name
+
+
+def activate_build(build) -> None:
+    """
+    Переключает "текущую" сборку на выбранную в карусели (см.
+    ui/carousel_window.py, core/builds.py::Build) — живьём меняет модульные
+    константы этого файла. `build` — любой объект с атрибутами
+    `.name`/`.remote_path` (core.builds.Build).
+
+    ВАЖНО, та же ловушка, что уже чинилась этим сеансом для DAV_PASSWORD
+    (см. CLAUDE.md): любой код, который читает эти константы через
+    `from config import DEPOT_REMOTE_PATH`/`MANIFEST_CACHE`/etc. (имя
+    попадает в локальную область модуля при импорте), НЕ увидит смену
+    сборки — такой импорт замораживает значение на момент импорта. Только
+    код, который делает `import config as _config` и читает
+    `_config.DEPOT_REMOTE_PATH` и т.п. ЖИВЬЁМ на момент вызова, подхватит
+    переключение. core/depot_client.py и core/workers.py уже переведены на
+    этот паттерн для всех констант, которые меняет эта функция — если
+    добавляется новый потребитель DEPOT_REMOTE_PATH/BUILD_NAME/
+    BUILD_DATA_DIR/MANIFEST_CACHE/POSTER_CACHE/MANIFEST_CHUNK_DB_CACHE/
+    SHORTCUT_ICON_CACHE, та же дисциплина обязательна.
+
+    Вызывается один раз, до создания UpdaterUI — карусель переключает
+    сборку, ПОТОМ открывает главное окно (см. main.py). Переключение "на
+    лету" при уже открытом главном окне не поддерживается и не нужно —
+    сменить сборку можно только перезапуском карусели.
+    """
+    global BUILD_NAME, DEPOT_REMOTE_PATH, BUILD_DATA_DIR
+    global MANIFEST_CACHE, POSTER_CACHE, MANIFEST_CHUNK_DB_CACHE, SHORTCUT_ICON_CACHE
+
+    BUILD_NAME        = build.name
+    DEPOT_REMOTE_PATH = build.remote_path
+    BUILD_DATA_DIR     = APPDATA_DIR / BUILD_NAME
+    BUILD_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    MANIFEST_CACHE          = BUILD_DATA_DIR / "manifest.json"
+    POSTER_CACHE             = BUILD_DATA_DIR / "poster.png"
+    MANIFEST_CHUNK_DB_CACHE = BUILD_DATA_DIR / "manifest_chunk_cache.db"
+    SHORTCUT_ICON_CACHE     = BUILD_DATA_DIR / "shortcut_icon.ico"
+
+
+def write_log_file(msg: str) -> None:
+    """
+    Дописывает строку в LOG_FILE (%APPDATA%\\TESVAE_Launcher\\launcher.log).
+    Единственное место с этой логикой — раньше жила только внутри
+    ui/main_window.py::UpdaterUI._write_log_file() как статический метод;
+    вынесена сюда, когда появился второй вызывающий (ui/carousel_window.py,
+    показывается ДО UpdaterUI и логирует в тот же файл до его создания) —
+    тянуть UpdaterUI только ради одного статического метода было лишней
+    связью между модулями. main_window.py теперь тоже зовёт эту функцию.
+    Best-effort — ошибка записи на диск никогда не должна ломать лог в UI,
+    только сама запись молча пропускается.
+    """
+    try:
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 def get_launcher_commit() -> str:
