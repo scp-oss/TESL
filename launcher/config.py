@@ -102,7 +102,14 @@ CHUNK_DIR = "chunks"
 JSON_SERVER = "https://nethunter.sytes.net/sky/"
 
 # ── Crash logger ──────────────────────────────────────────────────────────────
-CRASH_LOG_REMOTE_PATH = "1TB/CrashLogs"   # куда шлём репорты (тот же WebDAV)
+# Подтверждено пользователем 2026-09-22 (реальный листинг Nextcloud, живой
+# крэш-репорт от старой, ДОustановочной версии инструмента под ником "xcode",
+# .../CRASH_Log/xcode/10.03.2025-18.59.33/) — старое значение "1TB/CrashLogs"
+# было такой же устаревшей заглушкой, как раньше DEPOT_REMOTE_PATH. Финальная
+# структура (собирается в crash_logger.py::upload_files(), не трогал) —
+# <CRASH_LOG_REMOTE_PATH>/<username>/<ММ.ДД.ГГГГ-ЧЧ.ММ.СС>/ — уже совпадает
+# с реальным примером, чинить нужно было только сам путь.
+CRASH_LOG_REMOTE_PATH = "1TB/TESS/Staticfolders/CRASH_Log"
 
 # ── Настройки лаунчера — общие для всех сборок, прямо в APPDATA_DIR ───────────
 CONFIG_FILE      = APPDATA_DIR / "config.json"
