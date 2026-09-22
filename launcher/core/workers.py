@@ -453,19 +453,21 @@ class VerifyWorker(ThreadSafeWorker):
 
 class PosterLoader(ThreadSafeWorker):
     """Фоново скачивает постер."""
+    log     = pyqtSignal(str)
     loaded  = pyqtSignal(bytes)
     failed  = pyqtSignal()
 
     def run(self):
         try:
             client = DepotClient()
-            data   = client.fetch_poster()
+            data   = client.fetch_poster(on_log=self.log.emit)
             client.close()
             if data:
                 self.loaded.emit(data)
             else:
                 self.failed.emit()
-        except Exception:
+        except Exception as e:
+            self.log.emit(f"Постер: неожиданная ошибка — {e}")
             self.failed.emit()
 
 

@@ -219,17 +219,31 @@ class DepotClient:
 
     # ── poster.png ────────────────────────────────────────────────────────────
 
-    def fetch_poster(self) -> Optional[bytes]:
-        """Скачиваем постер (<remote_path>/src/image.png). Кэшируем локально."""
+    def fetch_poster(self, on_log=None) -> Optional[bytes]:
+        """
+        Скачиваем постер (<remote_path>/src/image.png). Кэшируем локально.
+        on_log(str), если передан, — единственное место, где реальная причина
+        неудачи (HTTP-код, исключение) не глотается молча — раньше эта
+        функция ловила любую ошибку через голый `except: pass`, и по UI
+        было невозможно понять, 404 это, проблема авторизации или что-то ещё.
+        """
+        url = self._url(BUILD_ASSETS_SUBDIR, POSTER_FILENAME)
         try:
-            r = self.session.get(self._url(BUILD_ASSETS_SUBDIR, POSTER_FILENAME), timeout=20)
+            r = self.session.get(url, timeout=20)
             if r.status_code == 200:
                 POSTER_CACHE.write_bytes(r.content)
+                if on_log:
+                    on_log(f"Постер загружен ({len(r.content)} байт): {url}")
                 return r.content
-        except Exception:
-            pass
+            if on_log:
+                on_log(f"Постер: HTTP {r.status_code} на {url}")
+        except Exception as e:
+            if on_log:
+                on_log(f"Постер: ошибка запроса {url} — {e}")
         # Fallback на кэш
         if POSTER_CACHE.exists():
+            if on_log:
+                on_log(f"Постер: беру из локального кэша ({POSTER_CACHE})")
             return POSTER_CACHE.read_bytes()
         return None
 

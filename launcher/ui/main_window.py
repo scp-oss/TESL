@@ -72,7 +72,13 @@ class PosterWidget(QLabel):
     def set_image(self, data: bytes):
         try:
             px = QPixmap()
-            px.loadFromData(data)
+            # loadFromData() возвращает bool, а не бросает исключение при
+            # неудаче — раньше это не проверялось, и битые/нераспознанные
+            # данные (200 OK, но не валидный PNG) тихо давали пустой
+            # QPixmap дальше по цепочке вместо явного "Постер недоступен".
+            if not px.loadFromData(data):
+                self.setText("Постер\nнедоступен (битые данные)")
+                return
             scaled = px.scaled(
                 self.W, self.H,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -453,6 +459,7 @@ class UpdaterUI(QWidget):
         worker = PosterLoader()
         thread = QThread()
         worker.moveToThread(thread)
+        worker.log.connect(self._append_log)
         worker.loaded.connect(self.poster.set_image)
         worker.failed.connect(self.poster.set_error)
         thread.started.connect(worker.run)
