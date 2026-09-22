@@ -15,7 +15,7 @@ import hashlib
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -211,6 +211,25 @@ class ChunkInstaller:
         self.on_log(f"📦 Уникальных чанков к загрузке: {len(needed_chunks)} ({_fmt_size(total_bytes)})")
 
         chunk_cache: Dict[str, bytes] = {}
+        # Потолок памяти на chunk_cache — БЕЗ него ничего не ограничивало,
+        # сколько данных может одновременно висеть в кэше. Живой инцидент
+        # 2026-09-22: у пользователя на установке в 173К файлов/83.9GB
+        # Windows залогировала Resource-Exhaustion-Detector (код 2004) за
+        # минуту до каскада отказов служб и краха диспетчера окон рабочего
+        # стола — на 32ГБ ОЗУ, с Discord и прочим открытым параллельно.
+        # Порядок закачки чанков — по хэшу (см. sorted(needed_chunks) ниже),
+        # который НИКАК не привязан к тому, какому файлу чанк принадлежит —
+        # у крупных многочанковых файлов их чанки могут приходить вперемешку
+        # СО ВСЕМИ ОСТАЛЬНЫМИ файлами всю установку, и ни один из них не
+        # освобождает кэш, пока не придёт последний чанк. Без потолка
+        # суммарный размер "скачано, но ещё не собрано" ничем не ограничен.
+        # CACHE_BYTES_LIMIT — используется в _submit_more() ниже, чтобы НЕ
+        # запускать новые закачки, пока в кэше уже накопилось больше этого —
+        # сборка (assemble_pool) продолжает работать независимо и освобождает
+        # память, приостановленные закачки возобновятся сами, как только
+        # места снова хватит.
+        CACHE_BYTES_LIMIT = 768 * 1024 * 1024
+        cached_bytes = 0
         failed_chunk_ids: Set[str] = set()
         done = 0
         downloaded_bytes = 0
@@ -241,23 +260,37 @@ class ChunkInstaller:
 
         # Пул для сборки файлов — отдельный от пула загрузки (self.max_workers,
         # обычно 24, см. config.CHUNK_MAX_WORKERS), поменьше: сборка — это
-        # диск+CPU (запись + sha256), не сеть, и на SSD должна успевать за
-        # 24 сетевых воркера с большим запасом даже на 4-8 потоках.
-        assemble_workers = min(8, max(4, os.cpu_count() or 4))
+        # диск+CPU (запись + sha256), не сеть. Потолок снижен 6->4
+        # (2026-09-22, живой случай пользователя) — DRAM-less NVMe
+        # (подтверждённая модель: MSI SPATIUM M450, без своего кэша,
+        # полагается на HMB) под длительной записью на маленьком SLC-кэше
+        # может ощутимо проседать по отклику, и если это тот же физический
+        # диск, что системный — тормозит вообще всю систему, не только
+        # установку (живой симптом: зависание Explorer/DWM во время
+        # установки). Меньше одновременных записей — меньше давление на
+        # контроллер в моменте, ценой небольшого запаса скорости сборки.
+        assemble_workers = min(4, max(2, os.cpu_count() or 4))
 
         def _dl(cid: str):
+            # Возвращает ТОЛЬКО данные — cid теперь известен вызывающему
+            # через in_flight (см. ниже), отдельно возвращать его не
+            # нужно (раньше было `return cid, ...`, парное распаковке
+            # `cid, data = future.result()` в старом цикле на as_completed).
             if self.should_stop():
-                return cid, None
+                return None
             self.wait_if_paused()
-            return cid, self.client.download_chunk(cid)
+            return self.client.download_chunk(cid)
 
         def _release_chunk(cid: str):
             # Вызывается ТОЛЬКО под `lock` — либо изнутри _assemble() (свой
             # `with lock:` в конце), либо из ветки "чанк не скачался" в
             # главном цикле (уже под lock там).
+            nonlocal cached_bytes
             chunk_refcount[cid] -= 1
             if chunk_refcount[cid] <= 0:
-                chunk_cache.pop(cid, None)
+                removed = chunk_cache.pop(cid, None)
+                if removed is not None:
+                    cached_bytes -= len(removed)
 
         def _assemble(i: int):
             """Выполняется в assemble_pool, НЕ в главном потоке. Чтение
@@ -327,39 +360,85 @@ class ChunkInstaller:
                     ok_files += 1
                 else:
                     fail_files += 1
-                for c in e.chunks:
-                    _release_chunk(c.chunk_id)
+                # {c.chunk_id for c in e.chunks} — ДЕДУПЛИЦИРОВАННЫЙ набор,
+                # не сырой e.chunks. Живой баг, найденный 2026-09-22 через
+                # KeyError в launcher.log пользователя: chunk_refcount[cid]
+                # изначально считает каждый ФАЙЛ, нуждающийся в чанке,
+                # ОДИН раз (chunk_to_files строится из dedup'нутого
+                # unique_ids при инициализации, см. выше) — но если этот
+                # ЧАНК встречается в e.chunks ФАЙЛА ДВАЖДЫ (одинаковый блок
+                # данных в двух разных offset'ах одного файла — обычное
+                # дело для content-addressed дедупа), старый код звал
+                # _release_chunk() на него ДВАЖДЫ при сборке ОДНОГО файла —
+                # refcount уходил в минус/обнулялся раньше времени, чанк
+                # вытеснялся из chunk_cache, пока другой файл, тоже на
+                # него ссылающийся, ещё не успел прочитать — тот самый
+                # KeyError в _assemble() у ДРУГОГО файла. Тот же баг был и
+                # в doom-ветке выше (see other_cid) — исправлено там же.
+                for cid_u in {c.chunk_id for c in e.chunks}:
+                    _release_chunk(cid_u)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool, \
              ThreadPoolExecutor(max_workers=assemble_workers) as assemble_pool:
             # sorted(), не просто needed_chunks (Set[str] — порядок обхода
             # не определён, с рандомизацией хэша меняется между запусками
-            # процесса) — прямой запрос пользователя 2026-09-22, после
-            # живого iostat на сервере показавшего sdb под депо на 100%
-            # util с r_await 100-260мс и aqu-sz 20-40 (см. CLAUDE.md
-            # "iostat подтвердил диск-бутылочное горлышко"): запрашивать
-            # чанки в ЛЕКСИКОГРАФИЧЕСКОМ порядке (= по chunk_id, что
-            # заодно группирует по первым 2 символам — тому же префиксу,
-            # что и подкаталог chunks/<xx>/ на сервере) даёт диску шанс
-            # обслуживать 24 параллельных запроса из УЗКОГО, близко
-            # расположенного окна вместо случайного разброса по всему
-            # депо — планировщик диска эффективнее сливает/переупорядочивает
-            # близкие запросы. Само по себе это не гарантирует физическую
-            # соседность (ext4 не обязан класть файлы на диск в порядке
-            # имён), но это условие NECESSARY для того, чтобы когда-либо
-            # выгодно воспользоваться (а) будущей физической
-            # перезаписью депо в этом же порядке или (b) переносом на
-            # NVMe (тогда неважно, но и не мешает) — без этой правки
-            # клиент запрашивал бы вразнобой, даже если сервер был бы
-            # уже физически отсортирован.
-            futures = {pool.submit(_dl, cid): cid for cid in sorted(needed_chunks)}
-            for future in as_completed(futures):
+            # процесса) — см. CLAUDE.md "iostat подтвердил диск-бутылочное
+            # горлышко" за причину (диск сервера, не клиента).
+            #
+            # НЕ submit'им всё сразу — раньше здесь было
+            # `{pool.submit(_dl, cid): cid for cid in sorted(needed_chunks)}`
+            # одним махом на ВСЕ needed_chunks (могут быть десятки тысяч).
+            # Живой инцидент 2026-09-22: у пользователя chunk_cache вырос
+            # до ~23ГБ (Диспетчер задач подтвердил, процесс Python) —
+            # ничего не ограничивало, сколько скачанных, но ещё не
+            # собранных чанков может висеть в памяти одновременно. Порядок
+            # по хэшу вообще не связан с тем, какому файлу чанк
+            # принадлежит — у файла с малым числом нужных чанков они
+            # могут оказаться далеко в конце очереди, и пока до них не
+            # дойдёт закачка, ни один такой файл не соберётся и не
+            # освободит память, а закачка тем временем продолжает копить
+            # ВСЁ подряд. _submit_more() ниже не даёт заказать больше
+            # self.max_workers чанков одновременно (как и раньше — просто
+            # явно, а не через исполнитель очереди задач) И не даёт
+            # заказывать новые, пока в кэше уже накопилось больше
+            # CACHE_BYTES_LIMIT — сборка (assemble_pool) продолжает
+            # работать в фоне независимо и освобождает память, точку
+            # ждём/пробуем снова с таймаутом ниже.
+            chunk_order = sorted(needed_chunks)
+            next_idx = 0
+            in_flight: Dict[object, str] = {}
+
+            def _submit_more():
+                nonlocal next_idx
+                while (next_idx < len(chunk_order)
+                       and len(in_flight) < self.max_workers
+                       and cached_bytes < CACHE_BYTES_LIMIT):
+                    cid = chunk_order[next_idx]
+                    next_idx += 1
+                    in_flight[pool.submit(_dl, cid)] = cid
+
+            _submit_more()
+            while in_flight:
                 if self.should_stop():
-                    for f in futures:
+                    for f in in_flight:
                         f.cancel()
                     self.on_log("⏹ Загрузка остановлена")
                     return False
-                cid, data = future.result()
+
+                done_set, _ = wait(list(in_flight.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_set:
+                    # Ничего не завершилось за секунду — либо все
+                    # max_workers заняты (штатно), либо сабмит стоит из-за
+                    # потолка памяти и ждёт, пока assemble_pool в фоне его
+                    # разгрузит. В обоих случаях просто пробуем досабмитить
+                    # ещё раз (no-op, если условия ещё не изменились) и
+                    # снова проверяем should_stop.
+                    _submit_more()
+                    continue
+
+                future = done_set.pop()
+                cid = in_flight.pop(future)
+                data = future.result()
                 ready: List[int] = []   # файлы, готовые к сборке — submit'ятся В assemble_pool ПОСЛЕ lock, не внутри него
                 with lock:
                     done += 1
@@ -375,11 +454,19 @@ class ChunkInstaller:
                                 continue
                             doomed[i] = True
                             fail_files += 1
-                            for other in to_process[i].chunks:
-                                if other.chunk_id != cid and other.chunk_id in chunk_refcount:
-                                    _release_chunk(other.chunk_id)
+                            # {c.chunk_id for c in ...} — ДЕДУПЛИЦИРОВАННЫЙ
+                            # набор, не сырой to_process[i].chunks. См.
+                            # комментарий у _assemble()'s cleanup ниже за
+                            # полную причину — тот же баг здесь: файл мог
+                            # быть учтён в chunk_refcount[X] только один
+                            # раз, даже если X встречается в его chunks
+                            # дважды.
+                            for other_cid in {c.chunk_id for c in to_process[i].chunks}:
+                                if other_cid != cid and other_cid in chunk_refcount:
+                                    _release_chunk(other_cid)
                     else:
                         chunk_cache[cid] = data
+                        cached_bytes += len(data)
                         downloaded_bytes += len(data)
 
                         for i in chunk_to_files[cid]:
@@ -432,6 +519,13 @@ class ChunkInstaller:
 
                 for i in ready:
                     assemble_pool.submit(_assemble, i)
+
+                # Догружаем очередь — освободившийся воркер (или место в
+                # кэше, если что-то из ready уже сборкой освободило часть
+                # cached_bytes на предыдущих итерациях) не должен простаивать
+                # до следующего таймаута. Без этого вызова здесь пайплайн
+                # разгружался бы, а не поддерживался полным.
+                _submit_more()
         # Оба `with`-пула закрылись здесь — assemble_pool.__exit__ дожидается
         # ВСЕХ поставленных _assemble(), так что к этому месту сборка файлов
         # тоже реально завершена, не только скачивание чанков.
