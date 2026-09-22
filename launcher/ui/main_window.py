@@ -122,6 +122,8 @@ class UpdaterUI(QWidget):
         self._is_closing     = False
         self._full_local_path = ""
         self._current_version = ""
+        self._status_button_mode = "install"   # "install" | "update" | "play" — см. _refresh_status_button()
+        self._pending_install_target = None    # version_label, который качает текущий install/update-запуск
 
         # ── Config ────────────────────────────────────────────────────────────
         self.data_lock    = threading.Lock()
@@ -151,6 +153,7 @@ class UpdaterUI(QWidget):
 
         # ── Load config ───────────────────────────────────────────────────────
         self._load_config()
+        self._refresh_status_button()
 
         # ── Theme ─────────────────────────────────────────────────────────────
         if self._detect_system_theme() == "dark":
@@ -325,7 +328,7 @@ class UpdaterUI(QWidget):
         self.lbl_explorer.mousePressEvent = lambda _: self._restart_explorer()
 
         self.btn_install.clicked.connect(self._install)
-        self.btn_launch.clicked.connect(self._launch_game)
+        self.btn_launch.clicked.connect(self._on_status_button_clicked)
         self.btn_patch.clicked.connect(self._patch_skyrim)
         self.btn_verify.clicked.connect(self._verify_files)
         self.btn_revert.clicked.connect(self._revert_skyrim)
@@ -392,6 +395,7 @@ class UpdaterUI(QWidget):
         self._save_config()
         self._update_folder_label()
         self._append_log(f"Выбрана папка: {folder}")
+        self._refresh_status_button()
 
     def _update_folder_label(self):
         if not self._full_local_path:
@@ -420,12 +424,15 @@ class UpdaterUI(QWidget):
             self.combo_versions.addItems(versions)
         else:
             self.combo_versions.addItem("Нет доступных версий")
+        self._refresh_status_button()
 
     def _on_current_version(self, label: str):
         self._current_version = label
         self.lbl_version.setText(f"Текущая версия: {label}")
+        self._refresh_status_button()
 
     def _on_version_selected(self, label: str):
+        self._refresh_status_button()
         if not label or label in ("Загрузка...", "Нет доступных версий"):
             return
         # Показываем заметки версии
@@ -499,6 +506,13 @@ class UpdaterUI(QWidget):
         version = self.combo_versions.currentText()
         if version in ("Загрузка...", "Нет доступных версий"):
             version = None
+
+        # Запоминаем, какую версию реально ставим — на завершении worker'а
+        # запишем её в config["installed_version"] (см. _on_worker_finished).
+        # version=None значит "текущая/последняя" — разрешаем в конкретную
+        # метку по своему приоритету, раз сервер сам её не всегда знает
+        # (у этой сборки "current" в depot.json пуст — см. CLAUDE.md).
+        self._pending_install_target = version or self._current_version or self.combo_versions.currentText()
 
         task = {"type": "install", "local_dir": self._full_local_path, "version_label": version}
         self._start_worker(task)
@@ -634,6 +648,50 @@ class UpdaterUI(QWidget):
         except Exception as e:
             self._append_log(f"Ошибка запуска: {e}")
 
+    # ── Status button (▶ TESVAE — install/update/play в одной кнопке) ──────────
+
+    def _refresh_status_button(self):
+        """
+        Определяет режим большой кнопки по центру:
+          - не выбрана папка ИЛИ ModOrganizer.exe там не найден -> "Установить"
+          - найден, но записанная installed_version не совпадает с выбранной/
+            текущей версией на сервере -> "Обновить"
+          - иначе (включая случай "не знаем installed_version" — например,
+            MO2 стоял ещё до этой возможности) -> "Играть"
+        Вызывается при любом событии, способном поменять эту картину: выбор
+        папки, загрузка списка версий, смена версии в комбобоксе, завершение
+        установки/обновления.
+        """
+        mo_exe = Path(self._full_local_path) / MO2_EXE if self._full_local_path else None
+        if not mo_exe or not mo_exe.exists():
+            self._set_status_button("install")
+            return
+
+        installed = self.config.get("installed_version", "")
+        target = self.combo_versions.currentText()
+        if target in ("Загрузка...", "Нет доступных версий", ""):
+            target = self._current_version
+
+        if installed and target and installed != target:
+            self._set_status_button("update")
+        else:
+            self._set_status_button("play")
+
+    def _set_status_button(self, mode: str):
+        self._status_button_mode = mode
+        if mode == "install":
+            self.btn_launch.setText("📥  Установить")
+        elif mode == "update":
+            self.btn_launch.setText("⬆  Обновить")
+        else:
+            self.btn_launch.setText("▶  Играть")
+
+    def _on_status_button_clicked(self):
+        if self._status_button_mode in ("install", "update"):
+            self._install()
+        else:
+            self._launch_game()
+
     # ── Version actions ───────────────────────────────────────────────────────
 
     def _update_to_latest(self):
@@ -641,6 +699,7 @@ class UpdaterUI(QWidget):
             self._choose_folder()
             if not self._full_local_path:
                 return
+        self._pending_install_target = self._current_version or self.combo_versions.currentText()
         task = {"type": "install", "local_dir": self._full_local_path, "version_label": None}
         self._start_worker(task)
 
@@ -652,6 +711,7 @@ class UpdaterUI(QWidget):
             self._choose_folder()
             if not self._full_local_path:
                 return
+        self._pending_install_target = label
         task = {"type": "install", "local_dir": self._full_local_path, "version_label": label}
         self._start_worker(task)
 
@@ -695,6 +755,12 @@ class UpdaterUI(QWidget):
         self.btn_pause.setText("⏸ Пауза")
         self.progress.setValue(0)
         self.progress.setFormat("")
+
+        if ok and self._pending_install_target:
+            self.config["installed_version"] = self._pending_install_target
+            self._save_config()
+        self._pending_install_target = None
+        self._refresh_status_button()
 
         if self.is_installing:
             self.is_installing = False
