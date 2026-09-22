@@ -14,6 +14,7 @@
 import hashlib
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
@@ -69,7 +70,6 @@ class ChunkInstaller:
         on_progress_max: Callable[[int], None] = lambda n: None,
         on_progress: Callable[[int], None] = lambda n: None,
         on_current: Callable[[str], None] = lambda s: None,
-        on_speed: Callable[[str], None] = lambda s: None,
         should_stop: Callable[[], bool] = lambda: False,
         wait_if_paused: Callable[[], None] = lambda: None,
     ):
@@ -80,19 +80,72 @@ class ChunkInstaller:
         self.on_progress_max = on_progress_max
         self.on_progress = on_progress
         self.on_current = on_current
-        self.on_speed = on_speed
         self.should_stop = should_stop
         self.wait_if_paused = wait_if_paused
 
     def diff(self, entries: List[FileEntry]) -> List[FileEntry]:
+        """
+        Сравнивает entries с локальными файлами (существование/размер/
+        sha256) — определяет, что реально нужно докачать. На крупной
+        сборке (173К файлов) это само по себе не мгновенно (полное чтение
+        + хэш каждого уже существующего файла) — раньше шло однопоточно
+        и БЕЗ какого-либо прогресса ("Сравниваем с локальными файлами..."
+        висело одной строкой до самого конца) — выглядело как зависание,
+        прямая жалоба пользователя 2026-09-22. Теперь: (1) прогресс —
+        процент/счётчик/ETA — идёт через те же on_progress_max/on_progress/
+        on_current, что и сама загрузка в install() ниже, скользящим
+        окном скорости (та же причина не считать средним с самого начала,
+        что и у install() — см. его комментарий у last_sample_t); (2) сам
+        хэш параллелится отдельным пулом (diff_workers, тот же принцип,
+        что и assemble_workers в install() — диск+CPU, не сеть, безопасно
+        параллелить на SSD).
+        """
         to_process: List[FileEntry] = []
-        for e in entries:
+        total = len(entries)
+        if total == 0:
+            return to_process
+
+        self.on_progress_max(total)
+        done = 0
+        last_sample_t = time.time()
+        last_sample_done = 0
+        smoothed_rate = 0.0   # файлов/сек, скользящее окно
+
+        def _check(e: FileEntry):
             local_path = self.local_dir / Path(e.rel_out_path.replace("/", os.sep))
             if not local_path.exists() or local_path.stat().st_size != e.size:
-                to_process.append(e)
-                continue
-            if _sha256_file(local_path) != e.file_hash:
-                to_process.append(e)
+                return e, True
+            return e, _sha256_file(local_path) != e.file_hash
+
+        diff_workers = min(8, max(4, os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=diff_workers) as pool:
+            # pool.map отдаёт результаты В ПОРЯДКЕ entries, блокируясь по
+            # очереди в ЭТОМ (вызывающем) потоке, пока каждый не готов —
+            # сам хэш идёт параллельно в diff_workers потоках, но этот
+            # цикл (и, значит, done/on_progress/on_current) выполняется
+            # только здесь, без гонок — отдельный lock не нужен.
+            for e, needs in pool.map(_check, entries):
+                if needs:
+                    to_process.append(e)
+                done += 1
+                self.on_progress(done)
+
+                now = time.time()
+                sample_dt = now - last_sample_t
+                if sample_dt >= 0.5 or done == total:
+                    inst_rate = (done - last_sample_done) / sample_dt if sample_dt > 0 else 0.0
+                    alpha = 0.3
+                    smoothed_rate = inst_rate if smoothed_rate == 0 else (
+                        alpha * inst_rate + (1 - alpha) * smoothed_rate)
+                    last_sample_t = now
+                    last_sample_done = done
+
+                pct = int(done / total * 100)
+                eta = _fmt_eta((total - done) / smoothed_rate) if smoothed_rate > 0 else "?"
+                self.on_current(
+                    f"Сравниваем с локальными файлами: {pct}% — {done}/{total} — осталось: {eta}"
+                )
+
         return to_process
 
     def install(self, entries: List[FileEntry]) -> bool:
@@ -164,9 +217,26 @@ class ChunkInstaller:
         written_bytes = 0
         ok_files, fail_files = 0, 0
         lock = threading.Lock()
-        import time
         start_t = time.time()
-        last_speed_log_t = 0.0   # для троттлинга on_speed() — см. комментарий ниже
+        # Для скорости в статус-баре — см. комментарий у места её показа
+        # ниже: НЕ просто downloaded_bytes/elapsed-с-самого-начала (это
+        # была бы усреднённая за ВСЮ установку скорость — при долгой
+        # установке она может застрять на старом низком значении надолго
+        # даже после того, как реальная скорость выросла, напр. после
+        # правки на сервере вроде pm.max_children — прямой живой случай
+        # 2026-09-22: пользователь поднял PHP-FPM с 5 до 32 воркеров
+        # посреди установки, а статус-бар всё ещё показывал "17 MB/s",
+        # потому что это было усреднение за уже прошедшие ~20+ минут).
+        # last_sample_* — точка отсчёта для скользящего окна (обновляется
+        # не чаще раза в 0.5с), smoothed_*_speed — экспоненциально
+        # сглаженное значение (alpha=0.3), чтобы не дёргалось от шума
+        # отдельных чанков, но быстро (за пару секунд) отражало реальные
+        # изменения скорости.
+        last_sample_t = start_t
+        last_sample_downloaded = 0
+        last_sample_written = 0
+        smoothed_dl_speed = 0.0
+        smoothed_wr_speed = 0.0
         self.on_progress_max(len(needed_chunks))
 
         # Пул для сборки файлов — отдельный от пула загрузки (self.max_workers,
@@ -243,7 +313,27 @@ class ChunkInstaller:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool, \
              ThreadPoolExecutor(max_workers=assemble_workers) as assemble_pool:
-            futures = {pool.submit(_dl, cid): cid for cid in needed_chunks}
+            # sorted(), не просто needed_chunks (Set[str] — порядок обхода
+            # не определён, с рандомизацией хэша меняется между запусками
+            # процесса) — прямой запрос пользователя 2026-09-22, после
+            # живого iostat на сервере показавшего sdb под депо на 100%
+            # util с r_await 100-260мс и aqu-sz 20-40 (см. CLAUDE.md
+            # "iostat подтвердил диск-бутылочное горлышко"): запрашивать
+            # чанки в ЛЕКСИКОГРАФИЧЕСКОМ порядке (= по chunk_id, что
+            # заодно группирует по первым 2 символам — тому же префиксу,
+            # что и подкаталог chunks/<xx>/ на сервере) даёт диску шанс
+            # обслуживать 24 параллельных запроса из УЗКОГО, близко
+            # расположенного окна вместо случайного разброса по всему
+            # депо — планировщик диска эффективнее сливает/переупорядочивает
+            # близкие запросы. Само по себе это не гарантирует физическую
+            # соседность (ext4 не обязан класть файлы на диск в порядке
+            # имён), но это условие NECESSARY для того, чтобы когда-либо
+            # выгодно воспользоваться (а) будущей физической
+            # перезаписью депо в этом же порядке или (b) переносом на
+            # NVMe (тогда неважно, но и не мешает) — без этой правки
+            # клиент запрашивал бы вразнобой, даже если сервер был бы
+            # уже физически отсортирован.
+            futures = {pool.submit(_dl, cid): cid for cid in sorted(needed_chunks)}
             for future in as_completed(futures):
                 if self.should_stop():
                     for f in futures:
@@ -282,26 +372,44 @@ class ChunkInstaller:
 
                     # ── Статус-бар: процент + скорость загрузки/записи + ETA
                     # (прямой запрос пользователя — раньше здесь была строка
-                    # "чанк <хэш>", бесполезная для оценки прогресса).
-                    # Считается на каждый чанк (дёшево — только форматирование
-                    # строки), но пишется в ЛОГ (on_speed) не чаще раза в
-                    # секунду — раньше on_speed слался на КАЖДЫЙ чанк (до
-                    # 155К записей в лог на одну установку — видно в скрине
-                    # пользователя, стена из "⬇ X MB/s"), теперь только
-                    # статус-бар обновляется так часто, лог — раз в секунду.
-                    elapsed = time.time() - start_t
+                    # "чанк <хэш>", бесполезная для оценки прогресса). Идёт
+                    # ТОЛЬКО в on_current (UI обновляет ОДНУ строку на месте,
+                    # setFormat() у QProgressBar — не append()), больше никуда:
+                    # раньше эта же скорость ДУБЛИРОВАНО ещё и слалась в
+                    # прокручиваемый лог (on_speed, было throttled до раза в
+                    # секунду) — на длинной установке это всё равно
+                    # накапливало тысячи почти одинаковых строк "⬇ X MB/s" в
+                    # логе (и в файле, и на экране), прямая жалоба
+                    # пользователя 2026-09-22. on_speed/on_current-в-лог
+                    # убраны целиком — единственное отображение скорости
+                    # теперь живёт в статус-баре, который сам по себе уже
+                    # обновляется на месте, без накопления строк.
                     pct = int(done / len(needed_chunks) * 100) if needed_chunks else 100
-                    dl_speed_bps = downloaded_bytes / elapsed if elapsed > 0 else 0
-                    wr_speed_bps = written_bytes / elapsed if elapsed > 0 else 0
+                    # Скользящее окно (см. комментарий у last_sample_t/
+                    # smoothed_*_speed выше) — НЕ downloaded_bytes/(время с
+                    # начала установки). Обновляем сэмпл не чаще раза в
+                    # 0.5с, между сэмплами показываем последнее сглаженное
+                    # значение (дешевле, и цифра не дёргается на каждый
+                    # чанк).
+                    now = time.time()
+                    sample_dt = now - last_sample_t
+                    if sample_dt >= 0.5:
+                        inst_dl = (downloaded_bytes - last_sample_downloaded) / sample_dt
+                        inst_wr = (written_bytes - last_sample_written) / sample_dt
+                        alpha = 0.3
+                        smoothed_dl_speed = inst_dl if smoothed_dl_speed == 0 else (
+                            alpha * inst_dl + (1 - alpha) * smoothed_dl_speed)
+                        smoothed_wr_speed = inst_wr if smoothed_wr_speed == 0 else (
+                            alpha * inst_wr + (1 - alpha) * smoothed_wr_speed)
+                        last_sample_t = now
+                        last_sample_downloaded = downloaded_bytes
+                        last_sample_written = written_bytes
                     bytes_remaining = total_bytes - downloaded_bytes
-                    eta = _fmt_eta(bytes_remaining / dl_speed_bps) if dl_speed_bps > 0 else "?"
+                    eta = _fmt_eta(bytes_remaining / smoothed_dl_speed) if smoothed_dl_speed > 0 else "?"
                     self.on_current(
-                        f"{pct}% — ⬇ {dl_speed_bps / 1024 / 1024:.1f} MB/s / "
-                        f"💾 {wr_speed_bps / 1024 / 1024:.1f} MB/s — осталось: {eta}"
+                        f"{pct}% — ⬇ {smoothed_dl_speed / 1024 / 1024:.1f} MB/s / "
+                        f"💾 {smoothed_wr_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
                     )
-                    if elapsed - last_speed_log_t >= 1.0:
-                        last_speed_log_t = elapsed
-                        self.on_speed(f"{dl_speed_bps / 1024 / 1024:.1f} MB/s")
 
                 for i in ready:
                     assemble_pool.submit(_assemble, i)

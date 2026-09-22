@@ -881,7 +881,6 @@ class UpdaterUI(QWidget):
         self.worker.progress_total_setmax.connect(self.progress.setMaximum)
         self.worker.progress_total.connect(self.progress.setValue)
         self.worker.current_file.connect(lambda s: self.progress.setFormat(s))
-        self.worker.speed_update.connect(lambda s: self._append_log(f"⬇ {s}"))
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.finished.connect(self.worker_thread.quit)
 

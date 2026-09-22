@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 # ── Версия лаунчера ───────────────────────────────────────────────────────────
-LAUNCHER_VERSION = "19.1.0"
+LAUNCHER_VERSION = "19.1.1"
 # WINDOW_TITLE больше НЕ статическая константа (была
 # "Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}") — прямой запрос
 # пользователя 2026-09-22: формат заголовка окна "TESL [commit luncher
@@ -65,6 +65,30 @@ except Exception:
 DAV_BASE_URL  = "https://nethunter.sytes.net/cloud/remote.php/dav/files/SkyrimDownloader"
 DAV_USERNAME  = "SkyrimDownloader"
 DAV_PASSWORD  = os.getenv("TESL_DAV_PASSWORD") or _LOCAL_DAV_PASSWORD or _CACHED_DAV_PASSWORD
+
+# DEPOT_READ_BASE_URL — базовый URL для ВСЕХ read-only запросов депо
+# (depot.json/манифесты/chunks/постер/иконка ярлыка/builds.json —
+# всё, что делает core/depot_client.py::DepotClient). Отдельно от
+# DAV_BASE_URL, потому что запись (crash-логи, debug-логи —
+# core/crash_logger.py, PUT/MKCOL) обязана остаться на настоящем
+# Nextcloud WebDAV — сейчас оба указывают на один и тот же сервер, но
+# это НЕ одно и то же по смыслу: прямой запрос пользователя 2026-09-22
+# ускорить установку (гигабитная LAN+интернет, а факт — ~17 MB/s
+# суммарно на 24 параллельных чанках) — узкое место не сеть/диск (см.
+# TESL-Manager/CLAUDE.md "Read-only nginx + Cloudflare...": ОДНО
+# WebDAV PUT-соединение уже даёт ~79 MB/s локально на этом же сервере),
+# а PHP/WebDAV-стек Nextcloud, через который идёт КАЖДЫЙ из 24
+# параллельных GET на чанк. Развёрнутый там же read-only nginx (читает
+# файлы депо напрямую с диска, в обход PHP) — готовый фикс для этого
+# узкого места, см. тот же докстринг за инфраструктуру; переключить
+# ЭТУ константу на его домен — весь необходимый клиентский код уже
+# готов принять смену (DepotClient ничего, кроме этого значения по
+# умолчанию, не меняет). НЕ переключено в этом заходе, пока
+# оператор не подтвердит curl'ом, что новый эндпоинт реально отдаёт
+# валидные данные (тот же принцип осторожности, что и в
+# TESL-Manager/CLAUDE.md) — до подтверждения оставлять равным
+# DAV_BASE_URL, это не ломает ничего, просто убирает выгоду.
+DEPOT_READ_BASE_URL = DAV_BASE_URL
 
 # Пути на сервере (относительно DAV_BASE_URL).
 # DEPOT_REMOTE_PATH подтверждён живым тестом 2026-09-21 (curl -I на

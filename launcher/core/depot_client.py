@@ -34,7 +34,7 @@ from requests.auth import HTTPBasicAuth
 # имени напрямую — это безопасно, они не меняются во время работы процесса.
 import config as _config
 from config import (
-    DAV_BASE_URL, DAV_USERNAME,
+    DEPOT_READ_BASE_URL, DAV_USERNAME,
     DEPOT_JSON_NAME, BUILD_ASSETS_SUBDIR,
     POSTER_FILENAME, SHORTCUT_ICON_FILENAME, SHORTCUT_ARG_FILENAME,
     CHUNK_DIR, BUILDS_REGISTRY_PATH,
@@ -57,7 +57,7 @@ class DepotClient:
 
     def __init__(
         self,
-        server_url:  str = DAV_BASE_URL,
+        server_url:  str = DEPOT_READ_BASE_URL,
         username:    str = DAV_USERNAME,
         password:    Optional[str] = None,
         remote_path: Optional[str] = None,

@@ -175,7 +175,6 @@ class DownloadWorker(ThreadSafeWorker):
     progress_total_setmax  = pyqtSignal(int)
     progress_total         = pyqtSignal(int)
     current_file           = pyqtSignal(str)
-    speed_update           = pyqtSignal(str)   # "12.3 MB/s"
     finished               = pyqtSignal(bool)
 
     def __init__(self, task: dict):
@@ -185,6 +184,14 @@ class DownloadWorker(ThreadSafeWorker):
         self._done      = 0
         self._start_t   = 0.0
         self._client    = None
+        # Скользящее окно для скорости (не средняя за всю установку с
+        # самого начала) — см. тот же фикс и его причину в
+        # core/chunk_installer.py::install() (комментарий у
+        # last_sample_t/smoothed_dl_speed там).
+        self._last_sample_t = 0.0
+        self._last_sample_bytes = 0
+        self._smoothed_speed = 0.0
+        self._downloaded_bytes = 0
 
     def run(self):
         try:
@@ -246,6 +253,10 @@ class DownloadWorker(ThreadSafeWorker):
             self.progress_total_setmax.emit(total_download)
             self._done   = 0
             self._start_t = time.time()
+            self._last_sample_t = self._start_t
+            self._last_sample_bytes = 0
+            self._smoothed_speed = 0.0
+            self._downloaded_bytes = 0
 
             failed: List[str] = []
             lock = threading.Lock()
@@ -269,18 +280,45 @@ class DownloadWorker(ThreadSafeWorker):
                 with lock:
                     self._done += 1
                     self.progress_total.emit(self._done)
-                    self.current_file.emit(rel_path)
 
-                    # Скорость
-                    elapsed = time.time() - self._start_t
-                    if elapsed > 0 and local_file.exists():
-                        total_bytes = sum(
-                            (local_dir / Path(p.replace("/", os.sep))).stat().st_size
-                            for p in (to_dl + to_redl)[:self._done]
-                            if (local_dir / Path(p.replace("/", os.sep))).exists()
-                        )
-                        speed = total_bytes / elapsed / 1024 / 1024
-                        self.speed_update.emit(f"{speed:.1f} MB/s")
+                    # Скорость — раньше слалась ОТДЕЛЬНЫМ сигналом
+                    # (speed_update) прямо в прокручиваемый лог, раз на
+                    # каждый файл, без троттлинга — на установке с тысячами
+                    # мелких файлов это забивало лог стеной из "⬇ X MB/s"
+                    # (прямая жалоба пользователя 2026-09-22, тот же класс
+                    # проблемы уже чинился для chunk-протокола, см.
+                    # core/chunk_installer.py::install()). Теперь скорость —
+                    # часть той же строки, что и current_file, которая уже
+                    # обновляется НА МЕСТЕ (progress.setFormat(), не append) —
+                    # отдельного сигнала/дублирования в лог больше нет.
+                    #
+                    # Скользящее окно, не среднее за всю установку с самого
+                    # начала — тот же фикс и та же причина, что в
+                    # core/chunk_installer.py::install() (см. его комментарий
+                    # у last_sample_t/smoothed_dl_speed): усреднение "с
+                    # начала" может застрять на старом низком значении
+                    # надолго даже после того, как реальная скорость
+                    # выросла. Заодно — раньше здесь на КАЖДЫЙ файл заново
+                    # суммировались размеры ВСЕХ уже скачанных файлов
+                    # (O(n) на файл, O(n²) в сумме) — теперь просто
+                    # прибавляем размер текущего файла к бегущему счётчику.
+                    if local_file.exists():
+                        self._downloaded_bytes += local_file.stat().st_size
+
+                    now = time.time()
+                    sample_dt = now - self._last_sample_t
+                    if sample_dt >= 0.5:
+                        inst = (self._downloaded_bytes - self._last_sample_bytes) / sample_dt
+                        alpha = 0.3
+                        self._smoothed_speed = inst if self._smoothed_speed == 0 else (
+                            alpha * inst + (1 - alpha) * self._smoothed_speed)
+                        self._last_sample_t = now
+                        self._last_sample_bytes = self._downloaded_bytes
+
+                    pct = int(self._done / total_download * 100) if total_download else 100
+                    self.current_file.emit(
+                        f"{pct}% — ⬇ {self._smoothed_speed / 1024 / 1024:.1f} MB/s — {rel_path}"
+                    )
 
                 if not ok_flag:
                     self.log.emit(f"❌ {msg}")
@@ -352,7 +390,6 @@ class DownloadWorker(ThreadSafeWorker):
             on_progress_max=self.progress_total_setmax.emit,
             on_progress=self.progress_total.emit,
             on_current=self.current_file.emit,
-            on_speed=self.speed_update.emit,
             should_stop=self._should_stop,
             wait_if_paused=self._wait_if_paused,
         )
