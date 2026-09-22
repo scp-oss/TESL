@@ -151,7 +151,10 @@ class UpdaterUI(QWidget):
         self.patcher_thread  = None
         self.version_worker  = None
         self.version_thread  = None
+        self.poster_worker   = None
         self.poster_thread   = None
+        self.crash_sender    = None
+        self.crash_thread    = None
 
         # ── UI Updater (потокобезопасный) ─────────────────────────────────────
         self.ui_updater = UIUpdater()
@@ -470,13 +473,22 @@ class UpdaterUI(QWidget):
     # ── Poster loader ─────────────────────────────────────────────────────────
 
     def _start_poster_loader(self):
-        worker = PosterLoader()
+        # worker хранится на self (self.poster_worker), не только thread —
+        # раньше это была локальная переменная, и это, похоже, было причиной
+        # того, что постер вообще никогда не грузился (ни успех, ни лог
+        # ошибки — вообще ничего): без живой Python-ссылки PyQt6 может
+        # собрать worker сборщиком мусора раньше, чем поток успеет дойти до
+        # `thread.started.connect(worker.run)` и реально вызвать run().
+        # Остальные воркеры в этом классе (self.worker/self.version_worker/
+        # self.verify_worker/self.patcher_worker) уже хранятся на self —
+        # этот был единственным исключением.
+        self.poster_worker = PosterLoader()
         thread = QThread()
-        worker.moveToThread(thread)
-        worker.log.connect(self._append_log)
-        worker.loaded.connect(self.poster.set_image)
-        worker.failed.connect(self.poster.set_error)
-        thread.started.connect(worker.run)
+        self.poster_worker.moveToThread(thread)
+        self.poster_worker.log.connect(self._append_log)
+        self.poster_worker.loaded.connect(self.poster.set_image)
+        self.poster_worker.failed.connect(self.poster.set_error)
+        thread.started.connect(self.poster_worker.run)
         thread.finished.connect(thread.deleteLater)
         self.poster_thread = thread
         thread.start()
@@ -950,18 +962,22 @@ class UpdaterUI(QWidget):
             return
 
         self._append_log("📤 Отправляем крэш-репорт...")
-        sender = CrashLogSender(username, skyrim_dir)
-        t = QThread()
-        sender.moveToThread(t)
-        sender.log.connect(self._append_log)
-        sender.finished.connect(lambda ok, msg: (
+        # И sender, и t хранятся на self — та же ловушка PyQt6, что чинил у
+        # PosterLoader (см. _start_poster_loader): локальные переменные без
+        # живой Python-ссылки рискуют быть собраны сборщиком мусора раньше,
+        # чем поток успеет реально вызвать sender.run().
+        self.crash_sender = CrashLogSender(username, skyrim_dir)
+        self.crash_thread = QThread()
+        self.crash_sender.moveToThread(self.crash_thread)
+        self.crash_sender.log.connect(self._append_log)
+        self.crash_sender.finished.connect(lambda ok, msg: (
             self._append_log(f"{'✅' if ok else '❌'} {msg}"),
             QMessageBox.information(self, "Репорт", msg) if ok else
             QMessageBox.warning(self, "Ошибка", msg),
-            t.quit(),
+            self.crash_thread.quit(),
         ))
-        t.started.connect(sender.run)
-        t.start()
+        self.crash_thread.started.connect(self.crash_sender.run)
+        self.crash_thread.start()
 
     def _open_donate(self):
         import webbrowser
