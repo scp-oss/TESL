@@ -16,7 +16,7 @@ import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from config import (
-    MAX_WORKERS, CHUNK_MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
+    MAX_WORKERS, CHUNK_MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME,
     DEPOT_REMOTE_PATH, MANIFEST_CACHE, MANIFEST_CHUNK_DB_CACHE,
 )
 from core.depot_client import DepotClient, _sha256

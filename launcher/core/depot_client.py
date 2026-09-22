@@ -23,8 +23,9 @@ from urllib.parse import quote
 import requests
 from requests.auth import HTTPBasicAuth
 
+import config as _config   # для DAV_PASSWORD — см. комментарий на __init__
 from config import (
-    DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
+    DAV_BASE_URL, DAV_USERNAME,
     DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, BUILD_ASSETS_SUBDIR,
     POSTER_FILENAME, SHORTCUT_ICON_FILENAME, SHORTCUT_ARG_FILENAME,
     MANIFEST_CACHE, POSTER_CACHE, SHORTCUT_ICON_CACHE, CHUNK_DIR,
@@ -49,14 +50,21 @@ class DepotClient:
         self,
         server_url:  str = DAV_BASE_URL,
         username:    str = DAV_USERNAME,
-        password:    str = DAV_PASSWORD,
+        password:    Optional[str] = None,
         remote_path: str = DEPOT_REMOTE_PATH,
         verify_ssl:  bool = True,
     ):
         self.base        = server_url.rstrip("/")
         self.remote_path = remote_path.strip("/")
         self.session     = requests.Session()
-        self.session.auth = HTTPBasicAuth(username, password)
+        # password=None -> берём config.DAV_PASSWORD ЖИВЬЁМ, на момент вызова,
+        # не на момент импорта этого модуля. `from config import DAV_PASSWORD`
+        # (как было раньше) заморозило бы значение в default-аргументе
+        # функции — если пользователь введёт пароль через диалог первого
+        # запуска (main.py::_ensure_dav_password()) уже ПОСЛЕ импорта, это
+        # никогда бы не подхватилось без перезапуска процесса.
+        effective_password = password if password is not None else _config.DAV_PASSWORD
+        self.session.auth = HTTPBasicAuth(username, effective_password)
         self.session.verify = verify_ssl
         self.session.headers["User-Agent"] = "TESVAE-Launcher/2.0"
 

@@ -11,20 +11,37 @@ from pathlib import Path
 LAUNCHER_VERSION = "19.0.8"
 WINDOW_TITLE     = f"Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}"
 
+# ── Локальные пути (перенесено сюда, наверх — нужны для DAV_PASSWORD_CACHE_FILE
+# ниже, до того как остальной APPDATA_DIR-блок появляется дальше по файлу) ─────
+APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "TESVAE_Launcher"
+APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # ── WebDAV ────────────────────────────────────────────────────────────────────
 # Базовый URL WebDAV (Nextcloud). Учётка read-only, общая для всех клиентов —
 # любой, кто соберёт .exe, может её извлечь (это ожидаемо для этой архитектуры,
-# см. CLAUDE.md "Секреты и их модель угроз"). НЕ храним пароль в git — он либо
-# приходит из ENV (сборка в CI), либо из launcher/secrets_local.py (untracked,
-# см. secrets_local.example.py), либо оставляем пустым для разработки без сети.
+# см. CLAUDE.md "Секреты и их модель угроз"). НЕ храним пароль в git — приоритет
+# источников: ENV (сборка в CI) -> launcher/secrets_local.py (untracked, см.
+# secrets_local.example.py, для разработки) -> локальный кэш-файл в APPDATA
+# (пишется, когда пользователь один раз вводит пароль в самом лаунчере — см.
+# main.py::_ensure_dav_password() — тот же принцип "не секрет в строгом
+# смысле", что и сам факт, что пароль всё равно зашит в каждый собранный .exe).
+DAV_PASSWORD_CACHE_FILE = APPDATA_DIR / "dav_password.txt"
+
 try:
     from secrets_local import DAV_PASSWORD as _LOCAL_DAV_PASSWORD
 except ImportError:
     _LOCAL_DAV_PASSWORD = ""
 
+_CACHED_DAV_PASSWORD = ""
+try:
+    if DAV_PASSWORD_CACHE_FILE.exists():
+        _CACHED_DAV_PASSWORD = DAV_PASSWORD_CACHE_FILE.read_text(encoding="utf-8").strip()
+except Exception:
+    pass
+
 DAV_BASE_URL  = "https://nethunter.sytes.net/cloud/remote.php/dav/files/SkyrimDownloader"
 DAV_USERNAME  = "SkyrimDownloader"
-DAV_PASSWORD  = os.getenv("TESL_DAV_PASSWORD", _LOCAL_DAV_PASSWORD)
+DAV_PASSWORD  = os.getenv("TESL_DAV_PASSWORD") or _LOCAL_DAV_PASSWORD or _CACHED_DAV_PASSWORD
 
 # Пути на сервере (относительно DAV_BASE_URL).
 # DEPOT_REMOTE_PATH подтверждён живым тестом 2026-09-21 (curl -I на
@@ -63,7 +80,7 @@ SHORTCUT_ARG_FILENAME  = "agr.json"
 # DownloadWorker сначала пробует его найти и, если он есть, качает сборку
 # напрямую из chunks/, не трогая files/<rel_path> вообще; если компаньона
 # нет (обычный HTTP 404) — молча работает по старому, "плоскому" протоколу.
-# (путь MANIFEST_CHUNK_DB_CACHE определён ниже, после APPDATA_DIR)
+# (путь MANIFEST_CHUNK_DB_CACHE — см. блок APPDATA_DIR-путей ниже)
 CHUNK_DIR = "chunks"
 
 # ── Старый JSON-сервер (для совместимости bootstrap'а) ────────────────────────
@@ -72,8 +89,7 @@ JSON_SERVER = "https://nethunter.sytes.net/sky/"
 # ── Crash logger ──────────────────────────────────────────────────────────────
 CRASH_LOG_REMOTE_PATH = "1TB/CrashLogs"   # куда шлём репорты (тот же WebDAV)
 
-# ── Локальные пути ────────────────────────────────────────────────────────────
-APPDATA_DIR      = Path(os.getenv("APPDATA") or Path.home()) / "TESVAE_Launcher"
+# ── Остальные локальные пути (APPDATA_DIR сам определён в самом верху файла) ──
 CONFIG_FILE      = APPDATA_DIR / "config.json"
 PROGRESS_FILE    = APPDATA_DIR / "progress.json"
 LOG_FILE         = APPDATA_DIR / "launcher.log"
@@ -83,8 +99,6 @@ MANIFEST_CHUNK_DB_CACHE = APPDATA_DIR / "manifest_chunk_cache.db"   # см. CHUN
 # .lnk-ярлык ссылается на иконку ФАЙЛОМ на диске (не встроенными байтами) —
 # поэтому иконку ярлыка нужно один раз сохранить локально, не только скачать.
 SHORTCUT_ICON_CACHE = APPDATA_DIR / "shortcut_icon.ico"
-
-APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Skyrim AE ─────────────────────────────────────────────────────────────────
 SKYRIM_TARGET_VERSION = "1.6.1170.0"

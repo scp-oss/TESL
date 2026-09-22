@@ -12,8 +12,9 @@ from urllib.parse import quote
 import requests
 from requests.auth import HTTPBasicAuth
 
+import config as _config   # для DAV_PASSWORD — см. upload_files()
 from config import (
-    DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
+    DAV_BASE_URL, DAV_USERNAME,
     CRASH_LOG_REMOTE_PATH,
 )
 
@@ -80,7 +81,7 @@ def upload_files(
     server_url:  str = DAV_BASE_URL,
     remote_path: str = CRASH_LOG_REMOTE_PATH,
     dav_user:    str = DAV_USERNAME,
-    dav_pass:    str = DAV_PASSWORD,
+    dav_pass:    Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Загружает файлы на WebDAV в структуру:
@@ -88,7 +89,10 @@ def upload_files(
     Возвращает (success, message).
     """
     session = requests.Session()
-    session.auth = HTTPBasicAuth(dav_user, dav_pass)
+    # dav_pass=None -> config.DAV_PASSWORD живьём на момент вызова, не на
+    # момент импорта (см. depot_client.py::DepotClient.__init__ — та же правка).
+    effective_pass = dav_pass if dav_pass is not None else _config.DAV_PASSWORD
+    session.auth = HTTPBasicAuth(dav_user, effective_pass)
     session.verify = True
 
     timestamp  = datetime.now().strftime("%m.%d.%Y-%H.%M.%S")

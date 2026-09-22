@@ -20,8 +20,9 @@ from urllib.parse import quote
 import requests
 from PyQt6.QtCore import pyqtSignal
 
+import config as _config   # для DAV_PASSWORD — см. _get_session()
 from config import (
-    DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
+    DAV_BASE_URL, DAV_USERNAME,
     PATCHER_REMOTE_PATH, APPDATA_DIR,
     MO2_EXE, MO2_SHORTCUT_NAME, MO2_SKSE_ARG,
     MO2_INI_SKYRIM_PLACEHOLDER_FWD, MO2_INI_SKYRIM_PLACEHOLDER_DBL,
@@ -82,7 +83,11 @@ class SkyrimPatcher(ThreadSafeWorker):
     def _get_session(self) -> requests.Session:
         if not self._session:
             self._session = requests.Session()
-            self._session.auth = (DAV_USERNAME, DAV_PASSWORD)
+            # config.DAV_PASSWORD живьём на момент вызова, не на момент
+            # импорта этого модуля (см. depot_client.py::DepotClient.__init__
+            # — та же правка, тот же повод: пароль может появиться позже,
+            # через диалог первого запуска в main.py).
+            self._session.auth = (DAV_USERNAME, _config.DAV_PASSWORD)
         return self._session
 
     # ── Skyrim detection (делегируем checker'у) ───────────────────────────────
