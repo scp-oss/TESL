@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
 
 from config import (
     WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR,
-    MO2_EXE, MO2_SKSE_ARG, get_asset_path,
+    MO2_EXE, MO2_SKSE_ARG, get_asset_path, get_launcher_commit,
 )
 from core.workers import (
     ThreadSafeWorker, VersionLoaderWorker, DownloadWorker,
@@ -130,6 +130,7 @@ class UpdaterUI(QWidget):
         self._current_version = ""
         self._status_button_mode = "install"   # "install" | "update" | "play" — см. _refresh_status_button()
         self._pending_install_target = None    # version_label, который качает текущий install/update-запуск
+        self._launcher_commit = get_launcher_commit()  # короткий git-хэш этого чекаута, "?" в собранном .exe
 
         # ── Config ────────────────────────────────────────────────────────────
         self.data_lock    = threading.Lock()
@@ -195,7 +196,7 @@ class UpdaterUI(QWidget):
         self.lbl_explorer.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.lbl_explorer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        self.lbl_version = QLabel("Текущая версия: не установлена")
+        self.lbl_version = QLabel(self._format_version_label("не установлена"))
         self.lbl_version.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         self.btn_theme = QPushButton("🌙")
@@ -432,9 +433,17 @@ class UpdaterUI(QWidget):
             self.combo_versions.addItem("Нет доступных версий")
         self._refresh_status_button()
 
+    def _format_version_label(self, version: str) -> str:
+        """"Текущая версия: X (лаунчер: <git-хэш>)" — хэш нужен, чтобы при
+        отладке видеть, какой код реально запущен, не гадать по выводу
+        update_and_run.bat в другом окне (см. CLAUDE.md, тот же повод, что и
+        у ложного "git pull failed" в этом сеансе). "?" в собранном .exe —
+        не ошибка, там нет .git, чтобы его спросить."""
+        return f"Текущая версия: {version}  (лаунчер: {self._launcher_commit})"
+
     def _on_current_version(self, label: str):
         self._current_version = label
-        self.lbl_version.setText(f"Текущая версия: {label}")
+        self.lbl_version.setText(self._format_version_label(label))
         self._refresh_status_button()
 
     def _on_version_selected(self, label: str):

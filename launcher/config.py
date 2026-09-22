@@ -183,3 +183,33 @@ def get_asset_path(name: str) -> Path:
     """Путь к bundled-ассету (работает и в .py и в PyInstaller exe)"""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     return base / name
+
+
+def get_launcher_commit() -> str:
+    """
+    Короткий git-хэш текущего чекаута лаунчера — показывается в UI рядом с
+    версией сборки (см. ui/main_window.py::lbl_version), чтобы при отладке
+    было видно, какой именно код реально запущен, а не предполагать это по
+    выводу `update_and_run.bat` в отдельном окне терминала. Прямой запрос
+    пользователя — тот же класс путаницы, что уже был в этом сеансе с
+    `git pull` (ложный "failed" на успешном fast-forward, неясно было, та
+    ли версия вообще запущена).
+
+    Работает только при запуске из git-чекаута (`launcher/` внутри клонированного
+    репозитория) — git сам находит `.git`, поднимаясь от cwd вверх по дереву,
+    так что можно звать из `launcher/`, не из корня репо. В собранном
+    PyInstaller .exe `.git` не бандлится вообще — возвращает "?", это НЕ
+    ошибка, просто нет откуда взять.
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "?"
