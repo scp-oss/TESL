@@ -211,7 +211,13 @@ class ChunkInstaller:
                         h.update(data)
                         file_bytes += len(data)
             except Exception as ex:
-                self.on_log(f"❌ Ошибка записи {e.rel_out_path}: {ex}")
+                # repr(), не str() — живой случай 2026-09-22: str(ex) может
+                # быть ПУСТОЙ строкой (напр. голый `MemoryError()` без
+                # аргументов даёт str() == "") — тогда лог показывал
+                # "Ошибка записи <путь>: " без единого намёка, что
+                # случилось. repr() всегда включает имя класса исключения
+                # даже при пустом сообщении.
+                self.on_log(f"❌ Ошибка записи {e.rel_out_path}: {type(ex).__name__}: {ex!r}")
                 ok = False
 
             if ok and h.hexdigest() != e.file_hash:

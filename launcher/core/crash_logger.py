@@ -74,6 +74,30 @@ def _make_dir(session: requests.Session, url: str, log):
         raise RuntimeError(f"MKCOL {url} → {r.status_code}")
 
 
+def _make_dir_recursive(session: requests.Session, base_url: str, path_segments, log):
+    """
+    MKCOL каждого сегмента пути по очереди, от корня вниз — не только
+    последней папки. Живой баг 2026-09-22: DEBUG_LOG_REMOTE_PATH
+    ("Staticfolders/DEBUG_Log") — новая папка, которую этот код никогда
+    заранее не создавал (в отличие от CRASH_LOG_REMOTE_PATH, чья папка на
+    сервере уже существовала до этой фичи) — старый _make_dir() вызывался
+    только на `<remote_path>/<username>/`, молча ПРЕДПОЛАГАЯ, что
+    <remote_path> САМ по себе уже существует. WebDAV MKCOL требует, чтобы
+    ВСЕ промежуточные коллекции уже существовали (RFC 4918) — если нет,
+    возвращает 409, а не создаёт их автоматически (не "mkdir -p"). Итог:
+    первая попытка отправить лог отладки на новую, ещё не созданную вручную
+    на сервере папку стабильно проваливалась с 409, и без ручного создания
+    папки оператором никогда бы не заработала сама. MKCOL на уже
+    существующую коллекцию возвращает 405 (обрабатывается как успех в
+    _make_dir), так что повторные вызовы для уже существующих сегментов
+    (как у CRASH_Log) безопасны и дёшевы.
+    """
+    url = base_url.rstrip("/")
+    for seg in path_segments:
+        url = f"{url}/{seg}"
+        _make_dir(session, url + "/", log)
+
+
 def upload_files(
     username:    str,
     files:       List[pathlib.Path],
@@ -102,8 +126,11 @@ def upload_files(
     folder_url = f"{user_url}{timestamp}/"
 
     try:
-        _make_dir(session, user_url, log)
-        _make_dir(session, folder_url, log)
+        # Каждый сегмент по очереди (remote_path -> username -> timestamp),
+        # не только последние два — см. _make_dir_recursive() за живой
+        # 409-баг, который это чинит. rp может содержать несколько
+        # сегментов сам по себе (напр. "1TB/TESS/Staticfolders/DEBUG_Log").
+        _make_dir_recursive(session, base_url, rp.split("/") + [username, timestamp], log)
     except RuntimeError as e:
         log(f"❌ {e}")
         return False, str(e)
