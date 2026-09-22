@@ -2,13 +2,13 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-echo === TESL: обновление из git + запуск ===
+echo === TESL: update from git + launch ===
 echo.
 
 git pull
 if errorlevel 1 (
     echo.
-    echo Ошибка git pull — смотри вывод выше. Запуск отменён.
+    echo git pull failed - see output above. Launch cancelled.
     pause
     exit /b 1
 )
@@ -16,19 +16,19 @@ if errorlevel 1 (
 cd launcher
 
 if defined TESL_DAV_PASSWORD (
-    echo Пароль WebDAV уже задан в переменной окружения.
+    echo WebDAV password already set via environment variable.
 ) else if exist "secrets_local.py" (
-    echo Использую launcher\secrets_local.py.
+    echo Using launcher\secrets_local.py.
 ) else (
     echo.
-    echo Пароль WebDAV не найден ^(ни в переменной окружения, ни в secrets_local.py^).
-    set /p TESL_DAV_PASSWORD="Введи пароль WebDAV: "
+    echo WebDAV password not found ^(no env var, no secrets_local.py^).
+    set /p TESL_DAV_PASSWORD="Enter WebDAV password: "
     setx TESL_DAV_PASSWORD "!TESL_DAV_PASSWORD!" >nul
-    echo Сохранено для этого пользователя Windows — в следующий раз спрашивать не будет.
+    echo Saved for this Windows user - won't ask again next time.
 )
 
 echo.
-echo Запускаем лаунчер...
+echo Starting launcher...
 echo.
 python main.py
 
