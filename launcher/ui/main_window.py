@@ -44,6 +44,7 @@ from core.workers import (
     VerifyWorker, PosterLoader, SkyrimCheckWorker, CrashLogSender,
 )
 from core.patcher import SkyrimPatcher, MO2Configurator
+from core.depot_client import DepotClient
 
 try:
     import winreg as _winreg
@@ -717,8 +718,48 @@ class UpdaterUI(QWidget):
         if result.found:
             game_folder = result.skyrim_dir
             MO2Configurator.update_ini(self._full_local_path, game_folder, log=self._append_log)
-        ok, msg = MO2Configurator.create_shortcut(self._full_local_path, log=self._append_log)
+        icon_path, arg = self._fetch_shortcut_assets()
+        ok, msg = MO2Configurator.create_shortcut(
+            self._full_local_path, log=self._append_log, icon_path=icon_path, arg=arg,
+        )
         self._append_log(msg)
+
+    def _fetch_shortcut_assets(self):
+        """
+        Качает иконку/аргумент ярлыка сборки с сервера (<remote_path>/src/
+        icon.ico и /src/agr.json). Возвращает (icon_path|None, arg|None) —
+        None в любом поле значит "не удалось/нет" — create_shortcut() сам
+        откатывается на прежнее поведение (иконка из TargetPath, дефолтный
+        MO2_SKSE_ARG). Никогда не бросает исключение наружу — падение этой
+        загрузки не должно мешать созданию ярлыка вообще.
+        """
+        icon_path = None
+        arg = None
+        try:
+            client = DepotClient()
+            icon = client.fetch_shortcut_icon()
+            if icon:
+                icon_path = str(icon)
+            arg_data = client.fetch_shortcut_arg()
+            if isinstance(arg_data, dict):
+                # Схема agr.json не подтверждена с сервера — пробуем
+                # несколько правдоподобных имён поля, не гадаем на одном.
+                for key in ("argument", "arg", "args", "skse_arg"):
+                    if isinstance(arg_data.get(key), str) and arg_data[key]:
+                        arg = arg_data[key]
+                        break
+                if arg is None:
+                    self._append_log(
+                        f"⚠️ agr.json скачан, но не нашли ожидаемое поле "
+                        f"(argument/arg/args/skse_arg) в {list(arg_data.keys())} — "
+                        f"использую аргумент по умолчанию"
+                    )
+            elif isinstance(arg_data, str) and arg_data:
+                arg = arg_data
+            client.close()
+        except Exception as e:
+            self._append_log(f"⚠️ Не удалось загрузить иконку/аргумент ярлыка с сервера: {e}")
+        return icon_path, arg
 
     def _stop_worker(self):
         if self.worker:
@@ -772,7 +813,10 @@ class UpdaterUI(QWidget):
             MO2Configurator.update_ini(
                 self._full_local_path, result.skyrim_dir, log=self._append_log
             )
-        ok, msg = MO2Configurator.create_shortcut(self._full_local_path, log=self._append_log)
+        icon_path, arg = self._fetch_shortcut_assets()
+        ok, msg = MO2Configurator.create_shortcut(
+            self._full_local_path, log=self._append_log, icon_path=icon_path, arg=arg,
+        )
         self._append_log(msg)
 
     def _restart_explorer(self):

@@ -43,13 +43,15 @@ MO2_REMOTE_PATH     = "1TB/MO2p"           # отдельный Mod Organizer (�
 # depot.json — индекс версий сборки (лежит в DEPOT_REMOTE_PATH)
 DEPOT_JSON_NAME = "depot.json"
 
-# Постер — подтверждено 2026-09-21: живёт СОВСЕМ в другой ветке, не рядом с
-# depot.json/chunks/versions — "Profils/<имя сборки>", не "Instances/<имя
-# сборки>", и имя файла не poster.png, а image.png. Поэтому — отдельный
-# независимый путь, не выводится из DEPOT_REMOTE_PATH (fetch_poster() строит
-# URL из этой пары напрямую, не через self.remote_path).
-POSTER_REMOTE_PATH = "1TB/TESS/Profils/TESVAE"
-POSTER_FILENAME    = "image.png"
+# Постер/иконка ярлыка/аргумент ярлыка — подтверждено 2026-09-21 (пользователь
+# прислал реальный листинг): все трое лежат в ОДНОЙ подпапке "src/" внутри
+# DEPOT_REMOTE_PATH (т.е. <DEPOT_REMOTE_PATH>/src/...), а не в отдельной ветке
+# "Profils" — более раннее предположение (POSTER_REMOTE_PATH отдельно от
+# remote_path) было неверным, убрано.
+BUILD_ASSETS_SUBDIR    = "src"
+POSTER_FILENAME        = "image.png"
+SHORTCUT_ICON_FILENAME = "icon.ico"
+SHORTCUT_ARG_FILENAME  = "agr.json"
 
 # ── Chunk-based версии (см. core/chunk_manifest_db.py) ────────────────────────
 # Некоторые версии физически хранятся как content-addressed чанки
@@ -78,6 +80,9 @@ LOG_FILE         = APPDATA_DIR / "launcher.log"
 MANIFEST_CACHE   = APPDATA_DIR / "manifest.json"   # кэш манифеста с сервера
 POSTER_CACHE     = APPDATA_DIR / "poster.png"
 MANIFEST_CHUNK_DB_CACHE = APPDATA_DIR / "manifest_chunk_cache.db"   # см. CHUNK_DIR выше
+# .lnk-ярлык ссылается на иконку ФАЙЛОМ на диске (не встроенными байтами) —
+# поэтому иконку ярлыка нужно один раз сохранить локально, не только скачать.
+SHORTCUT_ICON_CACHE = APPDATA_DIR / "shortcut_icon.ico"
 
 APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 

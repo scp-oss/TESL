@@ -385,8 +385,23 @@ class MO2Configurator:
             return False
 
     @staticmethod
-    def create_shortcut(mo2_dir: str, log=print) -> tuple[bool, str]:
-        """Создаёт ярлык TESVAE на рабочем столе."""
+    def create_shortcut(
+        mo2_dir: str,
+        log=print,
+        icon_path: Optional[str] = None,
+        arg: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """
+        Создаёт ярлык TESVAE на рабочем столе.
+
+        icon_path — путь к .ico для ярлыка (см. DepotClient.fetch_shortcut_icon()
+        — качается с <remote_path>/src/icon.ico); None/файл не существует —
+        ярлык остаётся без явной IconLocation (Windows берёт иконку из
+        TargetPath, как было раньше этой правки).
+        arg — аргумент запуска (см. DepotClient.fetch_shortcut_arg() —
+        <remote_path>/src/agr.json); None — используется дефолт MO2_SKSE_ARG
+        (было единственным поведением раньше этой правки).
+        """
         if os.name != "nt":
             return False, "Только Windows"
 
@@ -402,7 +417,14 @@ class MO2Configurator:
             fd, vbs_path = tempfile.mkstemp(suffix=".vbs")
             os.close(fd)
 
-            safe_args = MO2_SKSE_ARG.replace('"', '""')
+            effective_arg = arg if arg else MO2_SKSE_ARG
+            safe_args = effective_arg.replace('"', '""')
+
+            icon_line = ""
+            if icon_path and os.path.exists(icon_path):
+                safe_icon = _win_path(icon_path).replace('"', '""')
+                icon_line = f'oLink.IconLocation = "{safe_icon}"\n'
+
             script = (
                 f'Set oWS = WScript.CreateObject("WScript.Shell")\n'
                 f'sLinkFile = "{shortcut_path}"\n'
@@ -410,6 +432,7 @@ class MO2Configurator:
                 f'oLink.TargetPath = "{mo_exe}"\n'
                 f'oLink.Arguments = """{safe_args}"""\n'
                 f'oLink.WorkingDirectory = "{workdir}"\n'
+                f'{icon_line}'
                 f'oLink.Save\n'
             )
             with open(vbs_path, "w", encoding="utf-8") as f:

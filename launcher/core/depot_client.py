@@ -8,7 +8,9 @@ DepotClient — читает depot.json и скачивает файлы сбо�
   <remote_path>/manifest.json     — текущий манифест (files: {path: "sha256:hex"})
   <remote_path>/manifests/<ver>.json — манифест конкретной версии
   <remote_path>/files/<rel_path>  — файлы сборки
-  <remote_path>/poster.png        — постер
+  <remote_path>/src/image.png     — постер (подтверждено 2026-09-21)
+  <remote_path>/src/icon.ico      — иконка ярлыка сборки (подтверждено 2026-09-21)
+  <remote_path>/src/agr.json      — аргумент запуска ярлыка (подтверждено 2026-09-21)
 """
 import hashlib
 import json
@@ -23,8 +25,9 @@ from requests.auth import HTTPBasicAuth
 
 from config import (
     DAV_BASE_URL, DAV_USERNAME, DAV_PASSWORD,
-    DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, POSTER_REMOTE_PATH, POSTER_FILENAME,
-    MANIFEST_CACHE, POSTER_CACHE, CHUNK_DIR,
+    DEPOT_REMOTE_PATH, DEPOT_JSON_NAME, BUILD_ASSETS_SUBDIR,
+    POSTER_FILENAME, SHORTCUT_ICON_FILENAME, SHORTCUT_ARG_FILENAME,
+    MANIFEST_CACHE, POSTER_CACHE, SHORTCUT_ICON_CACHE, CHUNK_DIR,
 )
 
 
@@ -209,20 +212,9 @@ class DepotClient:
     # ── poster.png ────────────────────────────────────────────────────────────
 
     def fetch_poster(self) -> Optional[bytes]:
-        """
-        Скачиваем постер (PNG). Кэшируем локально.
-        Постер живёт в СВОЕЙ, отдельной от depot ветке (POSTER_REMOTE_PATH —
-        "Profils/<сборка>", не "Instances/<сборка>", где лежат depot.json/
-        chunks/versions) — поэтому URL строится напрямую от DAV_BASE_URL,
-        не через self._url() (тот всегда подставляет self.remote_path).
-        """
-        url = "/".join([
-            self.base,
-            POSTER_REMOTE_PATH.strip("/"),
-            quote(POSTER_FILENAME, safe=""),
-        ])
+        """Скачиваем постер (<remote_path>/src/image.png). Кэшируем локально."""
         try:
-            r = self.session.get(url, timeout=20)
+            r = self.session.get(self._url(BUILD_ASSETS_SUBDIR, POSTER_FILENAME), timeout=20)
             if r.status_code == 200:
                 POSTER_CACHE.write_bytes(r.content)
                 return r.content
@@ -231,6 +223,35 @@ class DepotClient:
         # Fallback на кэш
         if POSTER_CACHE.exists():
             return POSTER_CACHE.read_bytes()
+        return None
+
+    # ── Иконка/аргумент ярлыка (<remote_path>/src/, подтверждено 2026-09-21) ───
+
+    def fetch_shortcut_icon(self) -> Optional[Path]:
+        """
+        Скачиваем иконку ярлыка сборки в локальный кэш, возвращаем путь к
+        файлу (ярлык .lnk ссылается на иконку файлом на диске, не байтами
+        в памяти — поэтому возвращаем Path, а не bytes, как у постера).
+        """
+        try:
+            r = self.session.get(self._url(BUILD_ASSETS_SUBDIR, SHORTCUT_ICON_FILENAME), timeout=20)
+            if r.status_code == 200:
+                SHORTCUT_ICON_CACHE.write_bytes(r.content)
+                return SHORTCUT_ICON_CACHE
+        except Exception:
+            pass
+        if SHORTCUT_ICON_CACHE.exists():
+            return SHORTCUT_ICON_CACHE
+        return None
+
+    def fetch_shortcut_arg(self) -> Optional[dict]:
+        """Скачиваем и парсим <remote_path>/src/agr.json (аргумент запуска ярлыка)."""
+        try:
+            r = self.session.get(self._url(BUILD_ASSETS_SUBDIR, SHORTCUT_ARG_FILENAME), timeout=20)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
         return None
 
     # ── File download ─────────────────────────────────────────────────────────
