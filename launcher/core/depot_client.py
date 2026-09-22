@@ -448,7 +448,7 @@ def fetch_poster_bytes(remote_path: str, on_log=None) -> Optional[bytes]:
     заново; если станет проблемой при большом числе сборок — отдельная
     доработка (кэш по build.name), не сейчас.
     """
-    base = DAV_BASE_URL.rstrip("/")
+    base = DEPOT_READ_BASE_URL.rstrip("/")
     rp   = remote_path.strip("/")
     url  = f"{base}/{rp}/{BUILD_ASSETS_SUBDIR}/{POSTER_FILENAME}"
     try:
@@ -518,7 +518,7 @@ def fetch_shortcut_assets(log=print) -> Tuple[Optional[str], Optional[str]]:
 def fetch_builds_registry(on_log=None) -> Optional[list]:
     """
     Скачивает реестр доступных сборок для карусели —
-    <DAV_BASE_URL>/<config.BUILDS_REGISTRY_PATH>, ожидаемый JSON-массив
+    <DEPOT_READ_BASE_URL>/<config.BUILDS_REGISTRY_PATH>, ожидаемый JSON-массив
     [{"name": "...", "label": "...", "remote_path": "..."}, ...].
 
     НЕ существование этого файла на сервере СЕЙЧАС ещё не подтверждено —
@@ -530,7 +530,7 @@ def fetch_builds_registry(on_log=None) -> Optional[list]:
     Отдельная короткоживущая requests.Session — вне remote_path какой-либо
     конкретной сборки, реестр лежит на уровень выше.
     """
-    url = f"{DAV_BASE_URL.rstrip('/')}/{BUILDS_REGISTRY_PATH.strip('/')}"
+    url = f"{DEPOT_READ_BASE_URL.rstrip('/')}/{BUILDS_REGISTRY_PATH.strip('/')}"
     try:
         session = requests.Session()
         session.auth = HTTPBasicAuth(DAV_USERNAME, _config.DAV_PASSWORD)

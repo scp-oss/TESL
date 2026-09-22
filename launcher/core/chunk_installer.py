@@ -272,14 +272,29 @@ class ChunkInstaller:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             ok = True
             h = hashlib.sha256()
-            file_bytes = 0
             try:
                 with open(out_path, "wb") as f:
                     for c in sorted(e.chunks, key=lambda c: c.offset):
                         data = chunk_cache[c.chunk_id]
                         f.write(data)
                         h.update(data)
-                        file_bytes += len(data)
+                        n = len(data)
+                        # written_bytes растёт НА КАЖДЫЙ реально записанный
+                        # чанк, а не только когда весь файл дособран (см.
+                        # ниже — раньше это была единственная точка
+                        # обновления). Живая жалоба пользователя
+                        # 2026-09-22: "скорость записи" в статус-баре
+                        # показывала ~4 MB/s на SSD при 25 MB/s скачивания —
+                        # SSD был ни при чём, метрика просто считала байты
+                        # ЗАВЕРШЁННЫХ файлов, а у крупной сборки файл
+                        # собирается из многих чанков, приходящих вразнобой
+                        # по разным файлам одновременно — большую часть
+                        # времени НИ ОДИН файл ещё не готов целиком, хотя
+                        # диск реально пишет постоянно. Инкремент здесь
+                        # отражает настоящую скорость записи на диск, не
+                        # темп завершения файлов.
+                        with lock:
+                            written_bytes += n
             except Exception as ex:
                 # repr(), не str() — живой случай 2026-09-22: str(ex) может
                 # быть ПУСТОЙ строкой (напр. голый `MemoryError()` без
@@ -303,9 +318,13 @@ class ChunkInstaller:
                 ok = False
 
             with lock:
+                # written_bytes НЕ трогаем здесь второй раз — уже
+                # посчитан по каждому чанку в цикле записи выше (в т.ч.
+                # для файла, упавшего в исключение/верификации — те байты
+                # физически ушли на диск, для метрики скорости это
+                # правильно учесть, даже если сам файл в итоге ok=False).
                 if ok:
                     ok_files += 1
-                    written_bytes += file_bytes
                 else:
                     fail_files += 1
                 for c in e.chunks:
