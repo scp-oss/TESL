@@ -99,7 +99,12 @@ class CarouselWindow(QWidget):
     def __init__(self, on_build_selected):
         super().__init__()
         self._on_build_selected = on_build_selected
-        self.setWindowTitle("Выбор сборки")
+        # Тот же формат заголовка, что и у главного окна (см.
+        # config.get_window_title(), прямой запрос пользователя
+        # 2026-09-22, "TESL [commit vers]") — эта карусель тоже реальное
+        # окно приложения (первое, что видит пользователь при запуске),
+        # не отдельный from-scratch бренд.
+        self.setWindowTitle(f"{_config.get_window_title()} — выбор сборки")
         icon_path = get_asset_path("icon.ico")
         from PyQt6.QtGui import QIcon
         if icon_path.exists():

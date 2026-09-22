@@ -43,8 +43,8 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    WINDOW_TITLE, CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR,
-    MO2_EXE, MO2_SKSE_ARG, get_asset_path, get_launcher_commit,
+    CONFIG_FILE, PROGRESS_FILE, APPDATA_DIR,
+    MO2_EXE, MO2_SKSE_ARG, get_asset_path, get_launcher_commit, get_window_title,
 )
 from core.workers import (
     ThreadSafeWorker, VersionLoaderWorker, DownloadWorker,
@@ -122,7 +122,7 @@ class UpdaterUI(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(WINDOW_TITLE)
+        self.setWindowTitle(get_window_title())
         icon_path = get_asset_path("icon.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -137,8 +137,10 @@ class UpdaterUI(QWidget):
         self._is_closing     = False
         self._full_local_path = ""
         self._current_version = ""
-        self._status_button_mode = "install"   # "install" | "update" | "play" — см. _refresh_status_button()
+        self._status_button_mode = "install"   # "install" | "update" | "play" | "cancel" | "resume" — см. _refresh_status_button()
         self._pending_install_target = None    # version_label, который качает текущий install/update-запуск
+        self._current_task = None              # task-dict текущего DownloadWorker'а — см. _start_worker()/_toggle_pause()
+        self._paused_install = None            # {"local_dir","version_label"} из PROGRESS_FILE, если пауза пережила перезапуск — см. _load_config()/_toggle_pause()
         self._launcher_commit = get_launcher_commit()  # короткий git-хэш этого чекаута, "?" в собранном .exe
 
         # Разделитель новой сессии в LOG_FILE — файл иначе копился бы вечно
@@ -393,6 +395,21 @@ class UpdaterUI(QWidget):
         except Exception:
             pass
 
+        # Приостановленная установка, пережившая перезапуск лаунчера —
+        # прямой запрос пользователя: нажатие "Пауза" должно сохранять
+        # статус в файл в профиле, а при следующем запуске можно нажать
+        # "Продолжить". _refresh_status_button() (вызывается сразу после
+        # _load_config() в __init__) сама решает, показывать ли режим
+        # "resume" — сверяет local_dir с уже загруженным
+        # self._full_local_path (см. блок чуть выше в этой же функции).
+        self._paused_install = self.progress_data.get("paused_install")
+        if self._paused_install:
+            self._append_log(
+                f"⏸ Обнаружена приостановленная установка "
+                f"(версия: {self._paused_install.get('version_label') or '?'}) — "
+                f"можно продолжить"
+            )
+
     def _save_config(self):
         try:
             CONFIG_FILE.write_text(
@@ -410,6 +427,18 @@ class UpdaterUI(QWidget):
             )
         except Exception:
             pass
+
+    def _clear_paused_install(self):
+        """Убирает сохранённую отметку "пауза пережила перезапуск" — вызывается
+        при возобновлении установки в ТЕКУЩЕЙ сессии (незачем предлагать
+        "Продолжить" после следующего перезапуска, установка уже идёт) и при
+        любом завершении воркера (успех или явная отмена — см.
+        _on_worker_finished())."""
+        if self._paused_install is None and "paused_install" not in self.progress_data:
+            return
+        self._paused_install = None
+        self.progress_data.pop("paused_install", None)
+        self._save_progress()
 
     # ── Folder ────────────────────────────────────────────────────────────────
 
@@ -704,6 +733,11 @@ class UpdaterUI(QWidget):
     def _refresh_status_button(self):
         """
         Определяет режим большой кнопки по центру:
+          - есть приостановленная установка (пережила перезапуск лаунчера,
+            см. _toggle_pause()/_load_config()) ДЛЯ ТЕКУЩЕЙ папки ->
+            "Продолжить" (режим "resume", высший приоритет — если человек
+            специально ставил на паузу, не подсовывать вместо этого обычный
+            "Установить"/"Обновить")
           - не выбрана папка ИЛИ ModOrganizer.exe там не найден -> "Установить"
           - найден, но записанная installed_version не совпадает с выбранной/
             текущей версией на сервере -> "Обновить"
@@ -724,6 +758,9 @@ class UpdaterUI(QWidget):
         """
         if self.is_installing:
             return
+        if self._paused_install and self._paused_install.get("local_dir") == self._full_local_path:
+            self._set_status_button("resume")
+            return
         mo_exe = Path(self._full_local_path) / MO2_EXE if self._full_local_path else None
         if not mo_exe or not mo_exe.exists():
             self._set_status_button("install")
@@ -740,7 +777,7 @@ class UpdaterUI(QWidget):
             self._set_status_button("play")
 
     def _set_status_button(self, mode: str):
-        """mode: "install" | "update" | "play" | "cancel". "cancel" — во
+        """mode: "install" | "update" | "play" | "cancel" | "resume". "cancel" — во
         время активной установки (см. _install()) — раньше это была
         отдельная кнопка btn_install слева ("📥 Установить" <-> "⏹
         Отменить"); та колонка переехала в настройки (см. _open_settings()),
@@ -752,14 +789,48 @@ class UpdaterUI(QWidget):
             self.btn_launch.setText("⬆  Обновить")
         elif mode == "cancel":
             self.btn_launch.setText("⏹  Отменить")
+        elif mode == "resume":
+            self.btn_launch.setText("▶  Продолжить установку")
         else:
             self.btn_launch.setText("▶  Играть")
 
     def _on_status_button_clicked(self):
-        if self._status_button_mode in ("install", "update", "cancel"):
+        if self._status_button_mode == "resume":
+            self._resume_paused_install()
+        elif self._status_button_mode in ("install", "update", "cancel"):
             self._install()
         else:
             self._launch_game()
+
+    def _resume_paused_install(self):
+        """
+        Возобновляет установку, поставленную на паузу в ПРЕДЫДУЩЕМ запуске
+        лаунчера (self._paused_install, см. _toggle_pause()/_load_config()).
+        Ничего специального для самой докачки делать не нужно — diff()/
+        Range-докачка (см. core/chunk_installer.py::diff(),
+        core/depot_client.py::download_file()) уже пропускают всё, что
+        реально совпадает с манифестом на диске; это только восстанавливает
+        ЦЕЛЬ (папку/версию), чтобы пользователю не пришлось выбирать их
+        заново вручную.
+        """
+        paused = self._paused_install
+        if not paused:
+            self._refresh_status_button()
+            return
+
+        version_label = paused.get("version_label")
+        if version_label:
+            idx = self.combo_versions.findText(version_label)
+            if idx >= 0:
+                self.combo_versions.setCurrentIndex(idx)
+            # Если версии ещё не успели загрузиться (комбобокс всё ещё
+            # "Загрузка...") или этой метки в списке уже нет — не страшно,
+            # _install() сам трактует нераспознанный выбор как "текущая/
+            # последняя" (см. её собственную проверку версии).
+
+        self._clear_paused_install()
+        self._append_log("▶ Возобновляем ранее приостановленную установку...")
+        self._install()
 
     # ── Version actions ───────────────────────────────────────────────────────
 
@@ -794,6 +865,11 @@ class UpdaterUI(QWidget):
             self._append_log("Рабочий процесс уже запущен")
             return
 
+        # Запоминаем task целиком (не только _pending_install_target — та
+        # уже хранит version_label, но не local_dir) — нужен в
+        # _toggle_pause() для сохранения "что именно ставилось" на диск,
+        # если пользователь поставит на паузу.
+        self._current_task = task
         self.worker = DownloadWorker(task)
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
@@ -824,6 +900,15 @@ class UpdaterUI(QWidget):
         self.btn_pause.setText("⏸ Пауза")
         self.progress.setValue(0)
         self.progress.setFormat("")
+
+        # Воркер реально завершился (успех ИЛИ явная отмена — оба пути
+        # доходят сюда) — сохранённой "пауза пережила перезапуск" метке
+        # больше нечего резюмировать. НЕ вызывается, пока приложение
+        # закрывается ровно во время паузы (см. `if self._is_closing:
+        # return` выше) — это и есть тот случай, когда метка ДОЛЖНА
+        # пережить перезапуск, стирать её здесь в этом случае было бы
+        # неправильно.
+        self._clear_paused_install()
 
         if ok and self._pending_install_target:
             self.config["installed_version"] = self._pending_install_target
@@ -919,11 +1004,34 @@ class UpdaterUI(QWidget):
             self._worker_paused = False
             self.btn_pause.setText("⏸ Пауза")
             self._append_log("▶ Возобновлено")
+            # Установка снова реально идёт — метка "пауза пережила
+            # перезапуск" больше не актуальна для ЭТОЙ сессии (если
+            # процесс снова упадёт/закроется мы всё равно на паузе не
+            # стоим прямо сейчас). Если пользователь поставит на паузу ещё
+            # раз позже — сохранится заново.
+            self._clear_paused_install()
         else:
             target.pause()
             self._worker_paused = True
             self.btn_pause.setText("▶ Продолжить")
             self._append_log("⏸ Пауза")
+            # Прямой запрос пользователя: пауза должна сохранять статус
+            # выполнения в файл в профиле (PROGRESS_FILE, уже существовал
+            # как константа, но раньше ничего в него не писало), чтобы при
+            # следующем запуске лаунчера можно было нажать "Продолжить" —
+            # см. _refresh_status_button()'s режим "resume" и
+            # _resume_paused_install(). Только для install/update-воркера
+            # (self.worker) — верификация/патчинг не настолько долгие
+            # операции, чтобы стоило переживать их паузу через перезапуск
+            # приложения, и там нет предсказуемого "куда вернуться" вроде
+            # local_dir+version_label.
+            if target is self.worker and self._current_task:
+                self.progress_data["paused_install"] = {
+                    "local_dir": self._current_task.get("local_dir", self._full_local_path),
+                    "version_label": self._current_task.get("version_label") or self._pending_install_target,
+                }
+                self._paused_install = self.progress_data["paused_install"]
+                self._save_progress()
 
     # ── Button state helpers ──────────────────────────────────────────────────
 

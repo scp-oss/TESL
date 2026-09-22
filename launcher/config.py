@@ -9,7 +9,15 @@ from pathlib import Path
 
 # ── Версия лаунчера ───────────────────────────────────────────────────────────
 LAUNCHER_VERSION = "19.0.8"
-WINDOW_TITLE     = f"Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}"
+# WINDOW_TITLE больше НЕ статическая константа (была
+# "Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}") — прямой запрос
+# пользователя 2026-09-22: формат заголовка окна "TESL [commit luncher
+# vers]", то есть с git-хэшем ТЕКУЩЕГО чекаута, который можно узнать
+# только вызовом get_launcher_commit() (subprocess) — та функция
+# определена ниже по файлу, поэтому это функция, вычисляемая при
+# КАЖДОМ вызове (дёшево — тот же subprocess, что уже вызывается для
+# метки версии в правом верхнем углу, ui/main_window.py::
+# _format_version_label()), а не константа времени импорта модуля.
 
 # ── Локальные пути (перенесено сюда, наверх — нужны для DAV_PASSWORD_CACHE_FILE
 # ниже, до того как остальной APPDATA_DIR-блок появляется дальше по файлу) ─────
@@ -321,3 +329,13 @@ def get_launcher_commit() -> str:
     except Exception:
         pass
     return "?"
+
+
+def get_window_title() -> str:
+    """Заголовок окна — прямой запрос пользователя 2026-09-22, формат
+    "TESL [<git-хэш> <версия лаунчера>]", например "TESL [e6f7eb9 19.0.8]".
+    Заменил прежнюю статическую константу WINDOW_TITLE
+    ("Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}") — теперь функция,
+    вызывается при создании каждого окна (main_window.py), не константа
+    времени импорта, ради живого git-хэша (см. get_launcher_commit())."""
+    return f"TESL [{get_launcher_commit()} {LAUNCHER_VERSION}]"

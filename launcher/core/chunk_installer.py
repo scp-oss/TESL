@@ -32,6 +32,27 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _fmt_size(n: int) -> str:
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _fmt_eta(seconds: float) -> str:
+    if seconds < 0 or seconds != seconds:   # NaN check без импорта math
+        return "?"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}ч{m:02d}м"
+    if m:
+        return f"{m}м{s:02d}с"
+    return f"{s}с"
+
+
 class ChunkInstaller:
     """
     `client` — любой объект с методом `download_chunk(chunk_id: str) ->
@@ -84,6 +105,20 @@ class ChunkInstaller:
         OOM задолго до завершения. Чанк держится в кэше, только пока хотя
         бы один ещё не собранный файл на него ссылается (refcount),
         освобождается сразу после сборки последнего такого файла.
+
+        Сборка файла (запись на диск + верификация хэша) идёт в ОТДЕЛЬНОМ,
+        меньшем пуле потоков (`assemble_pool`), не в том же потоке, что
+        разбирает `as_completed()` для загрузок — см. CLAUDE.md "Сборка
+        файлов блокировала параллельную загрузку чанков" за полную историю
+        находки. Раньше `_assemble()` вызывался синхронно ВНУТРИ `with
+        lock:` в потоке, читающем `as_completed()` — дисковая запись +
+        повторное чтение+хэш КАЖДОГО файла (на этой сборке — 173К файлов)
+        сериализовались на ОДНОМ потоке, а не на 24 воркерах загрузки, и
+        именно это, не сеть, было реальным узким местом (эмпирически: рост
+        `CHUNK_MAX_WORKERS`/`pool_maxsize` 8->24/16->48 почти не сдвинул
+        скорость с ~10-13 MB/s на гигабитном SSD — то, что должно было
+        сильно помочь, не помогло, это и есть сигнал, что бутылочное
+        горлышко было не в числе соединений).
         """
         if not entries:
             self.on_log("⚠️ Chunk-манифест пуст")
@@ -101,29 +136,44 @@ class ChunkInstaller:
 
         # Для каждого чанка — какие файлы (по индексу в to_process) его ждут,
         # и refcount = сколько из них ещё не собрано (=не освободили чанк).
+        # chunk_size — нужен для точного total_bytes/ETA по байтам, не по
+        # числу чанков (размер чанка варьируется, до 4MB — см. config.py).
         chunk_to_files: Dict[str, List[int]] = {}
+        chunk_size:     Dict[str, int] = {}
         remaining: List[int] = []          # remaining[i] = сколько чанков файла i ещё не пришло
         doomed: List[bool] = []            # файл никогда не соберётся (пропал чанк)
         for i, e in enumerate(to_process):
             unique_ids = {c.chunk_id for c in e.chunks}
             remaining.append(len(unique_ids))
             doomed.append(False)
+            for c in e.chunks:
+                chunk_to_files.setdefault(c.chunk_id, [])
+                chunk_size[c.chunk_id] = c.size
             for cid in unique_ids:
-                chunk_to_files.setdefault(cid, []).append(i)
+                chunk_to_files[cid].append(i)
 
         chunk_refcount: Dict[str, int] = {cid: len(files) for cid, files in chunk_to_files.items()}
         needed_chunks: Set[str] = set(chunk_to_files.keys())
-        self.on_log(f"📦 Уникальных чанков к загрузке: {len(needed_chunks)}")
+        total_bytes = sum(chunk_size[cid] for cid in needed_chunks)
+        self.on_log(f"📦 Уникальных чанков к загрузке: {len(needed_chunks)} ({_fmt_size(total_bytes)})")
 
         chunk_cache: Dict[str, bytes] = {}
         failed_chunk_ids: Set[str] = set()
         done = 0
         downloaded_bytes = 0
+        written_bytes = 0
         ok_files, fail_files = 0, 0
         lock = threading.Lock()
         import time
         start_t = time.time()
+        last_speed_log_t = 0.0   # для троттлинга on_speed() — см. комментарий ниже
         self.on_progress_max(len(needed_chunks))
+
+        # Пул для сборки файлов — отдельный от пула загрузки (self.max_workers,
+        # обычно 24, см. config.CHUNK_MAX_WORKERS), поменьше: сборка — это
+        # диск+CPU (запись + sha256), не сеть, и на SSD должна успевать за
+        # 24 сетевых воркера с большим запасом даже на 4-8 потоках.
+        assemble_workers = min(8, max(4, os.cpu_count() or 4))
 
         def _dl(cid: str):
             if self.should_stop():
@@ -132,37 +182,61 @@ class ChunkInstaller:
             return cid, self.client.download_chunk(cid)
 
         def _release_chunk(cid: str):
+            # Вызывается ТОЛЬКО под `lock` — либо изнутри _assemble() (свой
+            # `with lock:` в конце), либо из ветки "чанк не скачался" в
+            # главном цикле (уже под lock там).
             chunk_refcount[cid] -= 1
             if chunk_refcount[cid] <= 0:
                 chunk_cache.pop(cid, None)
 
         def _assemble(i: int):
-            nonlocal ok_files, fail_files
+            """Выполняется в assemble_pool, НЕ в главном потоке. Чтение
+            chunk_cache[...] ниже безопасно без lock — чанки этого файла
+            остаются в кэше, пока их refcount не понизит _release_chunk()
+            НИЖЕ, в этой же функции, ПОСЛЕ чтения; ни один другой поток не
+            может вытеснить их раньше (никто другой не звонит _release_chunk
+            для чанков, которые всё ещё нужны именно этому файлу)."""
+            nonlocal ok_files, fail_files, written_bytes
             e = to_process[i]
             out_path = self.local_dir / Path(e.rel_out_path.replace("/", os.sep))
             out_path.parent.mkdir(parents=True, exist_ok=True)
             ok = True
+            h = hashlib.sha256()
+            file_bytes = 0
             try:
                 with open(out_path, "wb") as f:
                     for c in sorted(e.chunks, key=lambda c: c.offset):
-                        f.write(chunk_cache[c.chunk_id])
+                        data = chunk_cache[c.chunk_id]
+                        f.write(data)
+                        h.update(data)
+                        file_bytes += len(data)
             except Exception as ex:
                 self.on_log(f"❌ Ошибка записи {e.rel_out_path}: {ex}")
                 ok = False
 
-            if ok and _sha256_file(out_path) != e.file_hash:
+            if ok and h.hexdigest() != e.file_hash:
+                # Хэш считается ПРЯМО ПО ЗАПИСАННЫМ байтам, без повторного
+                # чтения с диска (раньше — _sha256_file(out_path), лишний
+                # проход диска на все 171GB суммарно). Каждый чанк уже
+                # верифицирован по sha256 индивидуально в
+                # DepotClient.download_chunk() — эта проверка ловит только
+                # неправильную СБОРКУ (порядок/пропуск чанка), не повреждение
+                # диска постфактум; для этого есть отдельная "Проверить
+                # файлы" (VerifyWorker) по требованию.
                 self.on_log(f"❌ Верификация провалена: {e.rel_out_path}")
                 ok = False
 
-            if ok:
-                ok_files += 1
-            else:
-                fail_files += 1
+            with lock:
+                if ok:
+                    ok_files += 1
+                    written_bytes += file_bytes
+                else:
+                    fail_files += 1
+                for c in e.chunks:
+                    _release_chunk(c.chunk_id)
 
-            for c in e.chunks:
-                _release_chunk(c.chunk_id)
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool, \
+             ThreadPoolExecutor(max_workers=assemble_workers) as assemble_pool:
             futures = {pool.submit(_dl, cid): cid for cid in needed_chunks}
             for future in as_completed(futures):
                 if self.should_stop():
@@ -171,10 +245,10 @@ class ChunkInstaller:
                     self.on_log("⏹ Загрузка остановлена")
                     return False
                 cid, data = future.result()
+                ready: List[int] = []   # файлы, готовые к сборке — submit'ятся В assemble_pool ПОСЛЕ lock, не внутри него
                 with lock:
                     done += 1
                     self.on_progress(done)
-                    self.on_current(f"чанк {cid[:8]}…")
 
                     if data is None:
                         failed_chunk_ids.add(cid)
@@ -192,16 +266,42 @@ class ChunkInstaller:
                     else:
                         chunk_cache[cid] = data
                         downloaded_bytes += len(data)
-                        elapsed = time.time() - start_t
-                        if elapsed > 0:
-                            self.on_speed(f"{downloaded_bytes / elapsed / 1024 / 1024:.1f} MB/s")
 
                         for i in chunk_to_files[cid]:
                             if doomed[i]:
                                 continue
                             remaining[i] -= 1
                             if remaining[i] == 0:
-                                _assemble(i)
+                                ready.append(i)
+
+                    # ── Статус-бар: процент + скорость загрузки/записи + ETA
+                    # (прямой запрос пользователя — раньше здесь была строка
+                    # "чанк <хэш>", бесполезная для оценки прогресса).
+                    # Считается на каждый чанк (дёшево — только форматирование
+                    # строки), но пишется в ЛОГ (on_speed) не чаще раза в
+                    # секунду — раньше on_speed слался на КАЖДЫЙ чанк (до
+                    # 155К записей в лог на одну установку — видно в скрине
+                    # пользователя, стена из "⬇ X MB/s"), теперь только
+                    # статус-бар обновляется так часто, лог — раз в секунду.
+                    elapsed = time.time() - start_t
+                    pct = int(done / len(needed_chunks) * 100) if needed_chunks else 100
+                    dl_speed_bps = downloaded_bytes / elapsed if elapsed > 0 else 0
+                    wr_speed_bps = written_bytes / elapsed if elapsed > 0 else 0
+                    bytes_remaining = total_bytes - downloaded_bytes
+                    eta = _fmt_eta(bytes_remaining / dl_speed_bps) if dl_speed_bps > 0 else "?"
+                    self.on_current(
+                        f"{pct}% — ⬇ {dl_speed_bps / 1024 / 1024:.1f} MB/s / "
+                        f"💾 {wr_speed_bps / 1024 / 1024:.1f} MB/s — осталось: {eta}"
+                    )
+                    if elapsed - last_speed_log_t >= 1.0:
+                        last_speed_log_t = elapsed
+                        self.on_speed(f"{dl_speed_bps / 1024 / 1024:.1f} MB/s")
+
+                for i in ready:
+                    assemble_pool.submit(_assemble, i)
+        # Оба `with`-пула закрылись здесь — assemble_pool.__exit__ дожидается
+        # ВСЕХ поставленных _assemble(), так что к этому месту сборка файлов
+        # тоже реально завершена, не только скачивание чанков.
 
         if failed_chunk_ids:
             self.on_log(f"❌ Не удалось скачать {len(failed_chunk_ids)} чанков — часть файлов пропущена")
