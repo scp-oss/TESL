@@ -22,6 +22,61 @@ from core.chunk_manifest_db import read_manifest_db
 from core.chunk_installer import ChunkInstaller
 
 
+# ── Chunk-манифест — общее для DownloadWorker и VerifyWorker ───────────────────
+
+def _get_version_manifest_rel_path(client: DepotClient, version_label: Optional[str]) -> Optional[str]:
+    """Находим путь к JSON-манифесту версии (info['manifest']) — нужен только
+    чтобы вычислить путь к её .db-компаньону, сам JSON тут не скачивается."""
+    index = client.fetch_depot_index()
+    if not index:
+        return None
+    if version_label is None:
+        current_key = index.get("current", {}).get("stable")
+        if not current_key:
+            return None
+        info = index.get("versions", {}).get(current_key)
+    else:
+        info = None
+        for release in index.get("versions", {}).values():
+            if release.get("label") == version_label:
+                info = release
+                break
+    return info.get("manifest") if info else None
+
+
+def _load_chunk_manifest(client: DepotClient, version_label: Optional[str]):
+    """
+    Возвращает (entries, meta), если у версии есть chunk-манифест
+    (компаньон .db), иначе None — версия опубликована по старому
+    "плоскому" протоколу (files/<rel_path>), вызывающему коду нужно
+    работать по нему.
+
+    Раньше эта логика жила только внутри DownloadWorker (установка) —
+    VerifyWorker ("Проверить файлы") о chunk-протоколе вообще не знал и
+    всегда пробовал старый DepotClient.fetch_manifest() (плоский
+    manifest.json). Для версии, опубликованной ТОЛЬКО через чанки (как
+    эта сборка), это либо честно проваливалось с "манифест недоступен"
+    (безопасно, ничего не трогает), либо — если на сервере завалялся
+    СТАРЫЙ manifest.json от версии до перехода на чанки — принимал его за
+    актуальный и посчитал бы почти все реально установленные 170К+
+    файлов "лишними", с реальным риском их удаления в цикле очистки.
+    Найдено и починено 2026-09-22 (живой репорт: лаунчер "схлопнулся" во
+    время "Проверить файлы" на chunk-based сборке). Вынесено в общую
+    функцию, чтобы у обоих воркеров было ровно одно определение "что
+    считается chunk-манифестом версии", не два копии, рискующие разойтись.
+    """
+    manifest_rel = _get_version_manifest_rel_path(client, version_label)
+    if not manifest_rel:
+        return None
+    db_bytes = client.fetch_manifest_db_bytes(manifest_rel)
+    if db_bytes is None:
+        return None
+    cache_path = _config.MANIFEST_CHUNK_DB_CACHE
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(db_bytes)
+    return read_manifest_db(cache_path)
+
+
 # ── Base ──────────────────────────────────────────────────────────────────────
 
 class ThreadSafeWorker(QObject):
@@ -262,26 +317,10 @@ class DownloadWorker(ThreadSafeWorker):
                 self._client.close()
 
     # ── Chunk-протокол (см. config.py "Chunk-based версии") ─────────────────────
-
-    def _get_version_manifest_rel_path(self, version_label: Optional[str]) -> Optional[str]:
-        """Находим путь к JSON-манифесту версии (info['manifest']) — нужен
-        только чтобы вычислить путь к её .db-компаньону, сам JSON тут не
-        скачивается (обычный путь скачает его сам через fetch_manifest())."""
-        index = self._client.fetch_depot_index()
-        if not index:
-            return None
-        if version_label is None:
-            current_key = index.get("current", {}).get("stable")
-            if not current_key:
-                return None
-            info = index.get("versions", {}).get(current_key)
-        else:
-            info = None
-            for release in index.get("versions", {}).values():
-                if release.get("label") == version_label:
-                    info = release
-                    break
-        return info.get("manifest") if info else None
+    # Обнаружение манифеста (_get_version_manifest_rel_path/_load_chunk_manifest)
+    # теперь общие module-level функции в начале файла — используются и
+    # DownloadWorker (здесь), и VerifyWorker, чтобы у обоих воркеров было
+    # ровно одно определение "что считается chunk-манифестом версии".
 
     def _try_chunk_install(self, version_label: Optional[str], local_dir: Path) -> Optional[bool]:
         """
@@ -293,28 +332,16 @@ class DownloadWorker(ThreadSafeWorker):
         (без Qt-зависимости, юнит-тестируется отдельно) — этот метод только
         находит манифест и прокидывает Qt-сигналы в его колбэки.
         """
-        manifest_rel = self._get_version_manifest_rel_path(version_label)
-        if not manifest_rel:
-            return None
-
-        db_bytes = self._client.fetch_manifest_db_bytes(manifest_rel)
-        if db_bytes is None:
-            return None
-
-        self.log.emit("📦 Обнаружен chunk-манифест — устанавливаем напрямую из chunks/ на сервере")
         try:
-            # _config.MANIFEST_CHUNK_DB_CACHE живьём, не через `from config
-            # import MANIFEST_CHUNK_DB_CACHE` — та заморозила бы путь на
-            # момент импорта этого модуля, раньше переключения сборки в
-            # карусели через config.activate_build() (см. её докстринг).
-            cache_path = _config.MANIFEST_CHUNK_DB_CACHE
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(db_bytes)
-            entries, meta = read_manifest_db(cache_path)
+            loaded = _load_chunk_manifest(self._client, version_label)
         except Exception as e:
             self.log.emit(f"❌ Не удалось прочитать chunk-манифест: {e}")
             return False
+        if loaded is None:
+            return None
+        entries, meta = loaded
 
+        self.log.emit("📦 Обнаружен chunk-манифест — устанавливаем напрямую из chunks/ на сервере")
         self.log.emit(f"📋 Версия по chunk-манифесту: {meta.get('version_key', '?')}")
 
         installer = ChunkInstaller(
@@ -350,7 +377,29 @@ class VerifyWorker(ThreadSafeWorker):
         try:
             self.log.emit("Начинаем проверку файлов...")
 
-            client   = DepotClient()
+            client = DepotClient()
+
+            # Chunk-протокол — проверяем ПЕРВЫМ, до старого плоского пути.
+            # Без этой проверки verify для chunk-based сборки либо честно
+            # проваливался ("манифест недоступен", безопасно), либо — если
+            # на сервере завалялся старый manifest.json от версии ДО
+            # перехода на чанки — принял бы его за актуальный и посчитал
+            # бы почти все реально установленные 170К+ файлов "лишними",
+            # с реальным риском их удаления в цикле очистки ниже. Живой
+            # репорт 2026-09-22: лаунчер "схлопнулся" во время "Проверить
+            # файлы" на chunk-based сборке — это и есть тот сценарий.
+            try:
+                loaded = _load_chunk_manifest(client, None)
+            except Exception as e:
+                self.log.emit(f"⚠️ Не удалось проверить chunk-манифест ({e}) — пробуем старый протокол")
+                loaded = None
+
+            if loaded is not None:
+                entries, meta = loaded
+                self.log.emit(f"📦 Обнаружен chunk-манифест — версия {meta.get('version_key', '?')}")
+                self._run_chunk_verify(client, entries)
+                return
+
             manifest = client.fetch_manifest()
 
             if not manifest:
@@ -409,6 +458,88 @@ class VerifyWorker(ThreadSafeWorker):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
                 futures = {pool.submit(_check_one, item): item for item in file_items}
+                for future in concurrent.futures.as_completed(futures):
+                    if self._should_stop():
+                        self.finished.emit(False, 0, 0, 0)
+                        return
+
+                    result = future.result()
+                    if result is None:
+                        continue
+
+                    status, path = result
+                    checked += 1
+
+                    elapsed = time.time() - self._start_t
+                    remaining = total - checked
+                    eta = ""
+                    if checked > 0 and elapsed > 0:
+                        rate = checked / elapsed
+                        eta  = _fmt_eta(remaining / rate if rate > 0 else 0)
+
+                    self.progress.emit(checked, total, eta)
+
+                    if status == "missing":
+                        to_dl.append(path)
+                    elif status == "corrupted":
+                        to_redl.append(path)
+
+            if self._should_stop():
+                self.finished.emit(False, 0, 0, 0)
+                return
+
+            self.log.emit(
+                f"Готово: к загрузке {len(to_dl)}, "
+                f"к перекачке {len(to_redl)}, "
+                f"удалено лишних {deleted}"
+            )
+            self.finished.emit(True, len(to_dl), len(to_redl), deleted)
+
+        except Exception as e:
+            import traceback
+            self.log.emit(f"Ошибка проверки: {e}\n{traceback.format_exc()}")
+            self.finished.emit(False, 0, 0, 0)
+
+    def _run_chunk_verify(self, client: DepotClient, entries) -> None:
+        """
+        Проверка chunk-based сборки — тот же цикл (ThreadPoolExecutor,
+        прогресс/пауза/отмена), что у флэт-протокола выше, только по
+        FileEntry из chunk-манифеста, а не {rel_path: hash} из
+        manifest.json. Не переиспользует ChunkInstaller.diff() напрямую —
+        тот метод однопоточный и без поддержки отмены/паузы/прогресса; для
+        170К+ файлов это выглядело бы как зависание, а не как идущая
+        проверка (тот же класс проблемы "тишина вместо обратной связи",
+        что уже чинился в этом репозитории для отправки лога отладки/
+        постера — см. CLAUDE.md).
+        """
+        try:
+            total = len(entries)
+            self.log.emit(f"Файлов в манифесте: {total}")
+
+            self.log.emit("Поиск лишних файлов...")
+            installer = ChunkInstaller(client=client, local_dir=self.local_dir, on_log=self.log.emit)
+            deleted = installer._cleanup_extra_files(entries)
+
+            self.log.emit("Проверка хэшей...")
+            to_dl, to_redl = [], []
+            checked = 0
+            self._start_t = time.time()
+
+            def _check_one(entry):
+                if self._should_stop():
+                    return None
+                self._wait_if_paused()
+                local = self.local_dir / Path(entry.rel_out_path.replace("/", os.sep))
+                if not local.exists():
+                    return ("missing", entry.rel_out_path)
+                if local.stat().st_size != entry.size:
+                    return ("corrupted", entry.rel_out_path)
+                if _sha256(local) != entry.file_hash:
+                    return ("corrupted", entry.rel_out_path)
+                return ("ok", entry.rel_out_path)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                futures = {pool.submit(_check_one, e): e for e in entries}
                 for future in concurrent.futures.as_completed(futures):
                     if self._should_stop():
                         self.finished.emit(False, 0, 0, 0)
