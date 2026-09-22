@@ -466,6 +466,55 @@ def fetch_poster_bytes(remote_path: str, on_log=None) -> Optional[bytes]:
     return None
 
 
+def fetch_shortcut_assets(log=print) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Качает иконку/аргумент ярлыка сборки с сервера (<remote_path>/src/
+    icon.ico и /src/agr.json). Возвращает (icon_path|None, arg|None) —
+    None в любом поле значит "не удалось/нет" —
+    MO2Configurator.create_shortcut() сам откатывается на прежнее
+    поведение (иконка из TargetPath, дефолтный MO2_SKSE_ARG). Никогда не
+    бросает исключение наружу — падение этой загрузки не должно мешать
+    созданию ярлыка вообще.
+
+    Перенесена сюда из ui/main_window.py::_fetch_shortcut_assets()
+    2026-09-22 — та версия делала два сетевых запроса (до 20с каждый)
+    ПРЯМО на GUI-потоке, вызывалась из _post_install_configure()/
+    _create_shortcut(), которые сами тоже целиком шли синхронно на
+    GUI-потоке вместе с SkyrimChecker().check() и subprocess-вызовом
+    MO2Configurator.create_shortcut() (до 30с) — суммарно интерфейс мог
+    замирать почти на минуту. Теперь свободная функция с параметром
+    log вместо self._append_log — вызывается из
+    core.workers.PostInstallWorker в фоновом потоке, см. её докстринг.
+    """
+    icon_path = None
+    arg = None
+    try:
+        client = DepotClient()
+        icon = client.fetch_shortcut_icon()
+        if icon:
+            icon_path = str(icon)
+        arg_data = client.fetch_shortcut_arg()
+        if isinstance(arg_data, dict):
+            # Схема agr.json не подтверждена с сервера — пробуем
+            # несколько правдоподобных имён поля, не гадаем на одном.
+            for key in ("argument", "arg", "args", "skse_arg"):
+                if isinstance(arg_data.get(key), str) and arg_data[key]:
+                    arg = arg_data[key]
+                    break
+            if arg is None:
+                log(
+                    f"⚠️ agr.json скачан, но не нашли ожидаемое поле "
+                    f"(argument/arg/args/skse_arg) в {list(arg_data.keys())} — "
+                    f"использую аргумент по умолчанию"
+                )
+        elif isinstance(arg_data, str) and arg_data:
+            arg = arg_data
+        client.close()
+    except Exception as e:
+        log(f"⚠️ Не удалось загрузить иконку/аргумент ярлыка с сервера: {e}")
+    return icon_path, arg
+
+
 def fetch_builds_registry(on_log=None) -> Optional[list]:
     """
     Скачивает реестр доступных сборок для карусели —

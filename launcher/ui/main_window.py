@@ -49,8 +49,9 @@ from config import (
 from core.workers import (
     ThreadSafeWorker, VersionLoaderWorker, DownloadWorker,
     VerifyWorker, PosterLoader, SkyrimCheckWorker, CrashLogSender,
+    PostInstallWorker,
 )
-from core.patcher import SkyrimPatcher, MO2Configurator
+from core.patcher import SkyrimPatcher
 from core.depot_client import DepotClient
 from core.debug_log import maybe_upload_debug_log
 from ui.settings_dialog import SettingsDialog
@@ -165,6 +166,8 @@ class UpdaterUI(QWidget):
         self.poster_thread   = None
         self.crash_sender    = None
         self.crash_thread    = None
+        self.postinstall_worker = None
+        self.postinstall_thread = None
 
         # ── UI Updater (потокобезопасный) ─────────────────────────────────────
         self.ui_updater = UIUpdater()
@@ -937,56 +940,35 @@ class UpdaterUI(QWidget):
         self._maybe_upload_debug_log("install")
 
     def _post_install_configure(self):
-        """После установки: обновляем INI + создаём ярлык."""
-        if not self._full_local_path:
-            return
-        from core.skyrim_checker import SkyrimChecker
-        result = SkyrimChecker().check(log=self._append_log)
-        if result.found:
-            game_folder = result.skyrim_dir
-            MO2Configurator.update_ini(self._full_local_path, game_folder, log=self._append_log)
-        icon_path, arg = self._fetch_shortcut_assets()
-        ok, msg = MO2Configurator.create_shortcut(
-            self._full_local_path, log=self._append_log, icon_path=icon_path, arg=arg,
-        )
-        self._append_log(msg)
+        """После установки: обновляем INI + создаём ярлык — через фоновый
+        воркер (PostInstallWorker), не синхронно на GUI-потоке. Раньше
+        этот метод сам делал SkyrimChecker().check() + сетевые запросы
+        (до 20с каждый) + subprocess для .lnk (до 30с) ПРЯМО здесь — GUI
+        мог замереть почти на минуту, полностью не отвечая ни на что.
+        Живой репорт 2026-09-22: лаунчер "завис" примерно в районе запуска
+        игры — см. core/workers.py::PostInstallWorker за полную историю."""
+        self._start_post_install_worker(self._full_local_path)
 
-    def _fetch_shortcut_assets(self):
-        """
-        Качает иконку/аргумент ярлыка сборки с сервера (<remote_path>/src/
-        icon.ico и /src/agr.json). Возвращает (icon_path|None, arg|None) —
-        None в любом поле значит "не удалось/нет" — create_shortcut() сам
-        откатывается на прежнее поведение (иконка из TargetPath, дефолтный
-        MO2_SKSE_ARG). Никогда не бросает исключение наружу — падение этой
-        загрузки не должно мешать созданию ярлыка вообще.
-        """
-        icon_path = None
-        arg = None
-        try:
-            client = DepotClient()
-            icon = client.fetch_shortcut_icon()
-            if icon:
-                icon_path = str(icon)
-            arg_data = client.fetch_shortcut_arg()
-            if isinstance(arg_data, dict):
-                # Схема agr.json не подтверждена с сервера — пробуем
-                # несколько правдоподобных имён поля, не гадаем на одном.
-                for key in ("argument", "arg", "args", "skse_arg"):
-                    if isinstance(arg_data.get(key), str) and arg_data[key]:
-                        arg = arg_data[key]
-                        break
-                if arg is None:
-                    self._append_log(
-                        f"⚠️ agr.json скачан, но не нашли ожидаемое поле "
-                        f"(argument/arg/args/skse_arg) в {list(arg_data.keys())} — "
-                        f"использую аргумент по умолчанию"
-                    )
-            elif isinstance(arg_data, str) and arg_data:
-                arg = arg_data
-            client.close()
-        except Exception as e:
-            self._append_log(f"⚠️ Не удалось загрузить иконку/аргумент ярлыка с сервера: {e}")
-        return icon_path, arg
+    def _start_post_install_worker(self, local_dir: str):
+        if not local_dir:
+            return
+        if self.postinstall_worker is not None:
+            self._append_log("Настройка после установки уже выполняется...")
+            return
+        self.postinstall_worker = PostInstallWorker(local_dir)
+        self.postinstall_thread = QThread()
+        self.postinstall_worker.moveToThread(self.postinstall_thread)
+        self.postinstall_worker.log.connect(self._append_log)
+        self.postinstall_worker.finished.connect(self._on_post_install_finished)
+        self.postinstall_thread.started.connect(self.postinstall_worker.run)
+        self.postinstall_thread.start()
+
+    def _on_post_install_finished(self, ok: bool, msg: str):
+        if self.postinstall_thread:
+            self.postinstall_thread.quit()
+            self.postinstall_thread.wait(2000)
+        self.postinstall_worker = None
+        self.postinstall_thread = None
 
     def _stop_worker(self):
         if self.worker:
@@ -1057,17 +1039,7 @@ class UpdaterUI(QWidget):
         if not self._full_local_path:
             self._append_log("Выберите папку MO2")
             return
-        from core.skyrim_checker import SkyrimChecker
-        result = SkyrimChecker().check(log=self._append_log)
-        if result.found:
-            MO2Configurator.update_ini(
-                self._full_local_path, result.skyrim_dir, log=self._append_log
-            )
-        icon_path, arg = self._fetch_shortcut_assets()
-        ok, msg = MO2Configurator.create_shortcut(
-            self._full_local_path, log=self._append_log, icon_path=icon_path, arg=arg,
-        )
-        self._append_log(msg)
+        self._start_post_install_worker(self._full_local_path)
 
     # ── Settings dialog ───────────────────────────────────────────────────────
 
@@ -1302,7 +1274,7 @@ class UpdaterUI(QWidget):
                 except Exception:
                     pass
         for attr in ("worker_thread", "verify_thread", "patcher_thread",
-                     "version_thread", "poster_thread"):
+                     "version_thread", "poster_thread", "postinstall_thread"):
             t = getattr(self, attr, None)
             if t and t.isRunning():
                 t.quit()

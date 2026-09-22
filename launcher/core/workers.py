@@ -677,6 +677,56 @@ class CrashLogSender(ThreadSafeWorker):
             self.finished.emit(False, str(e))
 
 
+# ── Post-install configurator ───────────────────────────────────────────────────
+
+class PostInstallWorker(ThreadSafeWorker):
+    """
+    Настройка после установки/по кнопке "Создать ярлык": проверка Skyrim,
+    правка ModOrganizer.ini под реальный путь игры, докачка иконки/
+    аргумента ярлыка с сервера, создание самого .lnk.
+
+    Раньше (до 2026-09-22) весь этот блок шёл СИНХРОННО на GUI-потоке —
+    ui/main_window.py::_post_install_configure()/_create_shortcut() дублировали
+    один и тот же код напрямую в обработчике. Реальная цена: SkyrimChecker
+    (диск/реестр) + два сетевых запроса (fetch_shortcut_assets, до 20с
+    каждый) + subprocess для .lnk (MO2Configurator.create_shortcut(),
+    timeout=30с) — суммарно интерфейс мог замереть почти на минуту,
+    полностью не отвечая ни на что. Живой репорт 2026-09-22: пользователь
+    сообщил, что лаунчер "завис" примерно в районе запуска игры — этот
+    синхронный блок точно совпадает по классу симптома (не подтверждено
+    как именно ЭТОТ конкретный случай, но сама дыра была реальной и
+    стоила исправления независимо от того, она ли была причиной в тот раз).
+    """
+    log      = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, local_dir: str):
+        super().__init__()
+        self.local_dir = local_dir
+
+    def run(self):
+        from core.skyrim_checker import SkyrimChecker
+        from core.patcher import MO2Configurator
+        from core.depot_client import fetch_shortcut_assets
+
+        try:
+            result = SkyrimChecker().check(log=self.log.emit)
+            if result.found:
+                MO2Configurator.update_ini(self.local_dir, result.skyrim_dir, log=self.log.emit)
+
+            icon_path, arg = fetch_shortcut_assets(log=self.log.emit)
+
+            ok, msg = MO2Configurator.create_shortcut(
+                self.local_dir, log=self.log.emit, icon_path=icon_path, arg=arg,
+            )
+            self.log.emit(msg)
+            self.finished.emit(ok, msg)
+        except Exception as e:
+            import traceback
+            self.log.emit(f"❌ Ошибка настройки после установки: {e}\n{traceback.format_exc()}")
+            self.finished.emit(False, str(e))
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _fmt_eta(seconds: float) -> str:
