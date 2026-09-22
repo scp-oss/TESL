@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 # ── Версия лаунчера ───────────────────────────────────────────────────────────
-LAUNCHER_VERSION = "19.2.0"
+LAUNCHER_VERSION = "19.2.1"
 # WINDOW_TITLE больше НЕ статическая константа (была
 # "Skyrim MO2 Updater + Patcher {LAUNCHER_VERSION}") — прямой запрос
 # пользователя 2026-09-22: формат заголовка окна "TESL [commit luncher

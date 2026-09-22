@@ -895,6 +895,30 @@ class UpdaterUI(QWidget):
     def _on_worker_finished(self, ok: bool):
         if self._is_closing:
             return
+        # .quit()+.wait() ПЕРЕД тем, как обнулить self.worker_thread —
+        # тот же паттерн, что уже верно используется в _on_verify_finished/
+        # _on_patcher_done/_on_post_install_finished в этом же файле, но
+        # почему-то отсутствовал именно здесь. Баг найден 2026-09-22:
+        # `self.worker.finished` уже подключён к `self.worker_thread.quit`
+        # (см. _start_worker) — но ЭТА функция, подключённая к тому же
+        # сигналу, обнуляла self.worker_thread СРАЗУ, не дожидаясь, пока
+        # поток реально остановится. Сигнал finished эмитится ИЗНУТРИ
+        # DownloadWorker.run(), ДО того как сам QThread успевает
+        # отрапортовать себе, что он больше не выполняется — если Python
+        # роняет последнюю живую ссылку на QThread в этом узком окне,
+        # PyQt может собрать сам QThread-объект мусорщиком, пока
+        # исполняемый им поток ОС формально ещё жив — ровно то, что
+        # выдаёт "QThread: Destroyed while thread '' is still running" и
+        # рушит процесс целиком (без питоновского traceback — это
+        # Qt-уровневый abort, не питоновское исключение). Живой инцидент:
+        # краш ровно в момент завершения фазы сравнения/начала закачки —
+        # раньше этого не ловили, вероятно потому что новый цикл закачки
+        # (_submit_more(), см. chunk_installer.py) чуть иначе выставляет
+        # тайминг эмита finished и сделал то же самое узкое окно гонки
+        # реально попадаемым на практике, а не только теоретическим.
+        if self.worker_thread is not None:
+            self.worker_thread.quit()
+            self.worker_thread.wait(2000)
         self.worker       = None
         self.worker_thread = None
         self._worker_paused = False
