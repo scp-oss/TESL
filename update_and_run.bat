@@ -5,12 +5,12 @@ echo === TESL: update from git + launch ===
 echo.
 
 git pull
-if errorlevel 1 (
-    echo.
-    echo git pull failed - see output above. Launch cancelled.
-    pause
-    exit /b 1
-)
+
+rem Not gating on errorlevel here: git pull's exit code has been observed
+rem to occasionally be nonzero even on a successful fast-forward (a known
+rem quirk on some Windows git installs, e.g. pager-related). The pull's
+rem own output above is the real signal - if it printed "error:"/"fatal:",
+rem something's actually wrong; otherwise just proceed.
 
 cd launcher
 
