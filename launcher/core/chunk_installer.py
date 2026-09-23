@@ -72,6 +72,7 @@ class ChunkInstaller:
         on_current: Callable[[str], None] = lambda s: None,
         should_stop: Callable[[], bool] = lambda: False,
         wait_if_paused: Callable[[], None] = lambda: None,
+        cache_bytes_limit: int = 768 * 1024 * 1024,
     ):
         self.client = client
         self.local_dir = Path(local_dir)
@@ -82,6 +83,14 @@ class ChunkInstaller:
         self.on_current = on_current
         self.should_stop = should_stop
         self.wait_if_paused = wait_if_paused
+        # Параметр конструктора (не просто локальная константа в
+        # install()) — чтобы тест мог поставить крошечный потолок и
+        # реально прогнать сценарий "потолок заполнен раньше, чем
+        # готов первый файл" вместо простого прохода на 768MB, который
+        # никогда его не заденет на маленьких синтетических данных. См.
+        # CLAUDE.md за живой баг, который эта возможность тестирования
+        # должна была поймать заранее.
+        self.cache_bytes_limit = cache_bytes_limit
 
     def diff(self, entries: List[FileEntry]) -> List[FileEntry]:
         """
@@ -223,12 +232,12 @@ class ChunkInstaller:
         # СО ВСЕМИ ОСТАЛЬНЫМИ файлами всю установку, и ни один из них не
         # освобождает кэш, пока не придёт последний чанк. Без потолка
         # суммарный размер "скачано, но ещё не собрано" ничем не ограничен.
-        # CACHE_BYTES_LIMIT — используется в _submit_more() ниже, чтобы НЕ
-        # запускать новые закачки, пока в кэше уже накопилось больше этого —
-        # сборка (assemble_pool) продолжает работать независимо и освобождает
+        # self.cache_bytes_limit (параметр конструктора, см. __init__) —
+        # используется в _submit_more() ниже, чтобы НЕ запускать новые
+        # закачки, пока в кэше уже накопилось больше этого — сборка
+        # (assemble_pool) продолжает работать независимо и освобождает
         # память, приостановленные закачки возобновятся сами, как только
         # места снова хватит.
-        CACHE_BYTES_LIMIT = 768 * 1024 * 1024
         cached_bytes = 0
         failed_chunk_ids: Set[str] = set()
         done = 0
@@ -401,7 +410,7 @@ class ChunkInstaller:
             # self.max_workers чанков одновременно (как и раньше — просто
             # явно, а не через исполнитель очереди задач) И не даёт
             # заказывать новые, пока в кэше уже накопилось больше
-            # CACHE_BYTES_LIMIT — сборка (assemble_pool) продолжает
+            # self.cache_bytes_limit — сборка (assemble_pool) продолжает
             # работать в фоне независимо и освобождает память, точку
             # ждём/пробуем снова с таймаутом ниже.
             chunk_order = sorted(needed_chunks)
@@ -410,20 +419,58 @@ class ChunkInstaller:
 
             def _submit_more():
                 nonlocal next_idx
+                # `or not in_flight` — предохранитель от НАСТОЯЩЕГО
+                # дедлока, найденного тестом 2026-09-23: ничего не
+                # вытесняет уже закэшированные чанки, кроме завершения
+                # файла, которому они нужны. Если потолок заполнен, а
+                # НИ ОДИН файл ещё не готов (его чанки, по хэшу, ещё
+                # дальше по очереди) — без этого условия закачка
+                # застревала бы НАВСЕГДА: новые чанки не заказываются
+                # (потолок), старые не освобождаются (некому собираться), ждать
+                # нечего. Когда in_flight пуст (прогресс невозможен
+                # вообще никак), потолок игнорируется РОВНО на один
+                # чанк — этого достаточно, чтобы next_idx гарантированно
+                # продвигался вперёд, пока не наберётся полный набор для
+                # какого-то файла и сборка не разгрузит кэш; в обычном
+                # режиме (в очереди уже что-то есть) потолок работает как
+                # раньше, строго.
                 while (next_idx < len(chunk_order)
                        and len(in_flight) < self.max_workers
-                       and cached_bytes < CACHE_BYTES_LIMIT):
+                       and (cached_bytes < self.cache_bytes_limit or not in_flight)):
                     cid = chunk_order[next_idx]
                     next_idx += 1
                     in_flight[pool.submit(_dl, cid)] = cid
 
             _submit_more()
-            while in_flight:
+            # while in_flight ИЛИ ещё есть что заказать — не просто
+            # while in_flight. Найденный вживую критический баг
+            # 2026-09-23: если потолок памяти (CACHE_BYTES_LIMIT) уже
+            # заполнен, а НИ ОДИН файл ещё не собрался (чтобы освободить
+            # кэш), _submit_more() перестаёт заказывать новые чанки —
+            # уже заказанные быстро докачиваются, in_flight пустеет, и
+            # цикл `while in_flight:` ЗАВЕРШАЛСЯ, думая, что всё готово,
+            # хотя next_idx << len(chunk_order) — тысячи чанков так и не
+            # были даже запрошены. Итог у пользователя: "✅ Установка
+            # завершена: 0 файлов" почти сразу, без единой ошибки в логе
+            # (ни один файл даже не пытался собраться — ошибок писать
+            # было не о чем), и при каждом следующем запуске diff
+            # СТАБИЛЬНО находил один и тот же неизменный список "требует
+            # обновления" — реального прогресса не было никогда.
+            while in_flight or next_idx < len(chunk_order):
                 if self.should_stop():
                     for f in in_flight:
                         f.cancel()
                     self.on_log("⏹ Загрузка остановлена")
                     return False
+
+                if not in_flight:
+                    # next_idx < len(chunk_order), но _submit_more() ничего
+                    # не добавил — потолок памяти ещё не разгрузился.
+                    # Секунда на фоновую сборку освободить место, затем
+                    # пробуем снова (не крутим пустой цикл без сна).
+                    time.sleep(1.0)
+                    _submit_more()
+                    continue
 
                 done_set, _ = wait(list(in_flight.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
                 if not done_set:
