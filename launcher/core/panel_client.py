@@ -38,7 +38,7 @@ GET /api/depot/<build_id>/<любой другой путь>  как есть �
     patch/*, patchs/*, poster.png
 ```
 
-`PANEL_BASE_URL` — см. config.py, ещё НЕ подтверждён реальным доменом.
+`PANEL_BASE_URL` — см. config.py, подтверждён реальным доменом 2026-09-28.
 """
 import hashlib
 import json
