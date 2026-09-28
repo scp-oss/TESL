@@ -6,11 +6,12 @@
 (ui/main_window.py::UpdaterUI) — main.py сначала открывает это окно, и
 только после выбора плитки открывает UpdaterUI для выбранной сборки.
 
-Сегодня реально существует одна сборка (TESVAE) — реестр builds.json на
-сервере ещё не подтверждён (см. config.py::BUILDS_REGISTRY_PATH,
-core/builds.py). Карусель поэтому всегда показывает хотя бы одну плитку и
-работает уже сейчас, а когда реестр появится на сервере — подхватит
-остальные сборки сама, без изменений здесь.
+**2026-09-28: список сборок — с TESL-Panel** (GET /api/builds, см.
+core/builds.py/core/panel_client.py), не WebDAV builds.json — карусель
+показывает РЕАЛЬНО существующие на панели сборки, ни одной "зашитой"
+по умолчанию не осталось; при пустом ответе панели показывает
+понятный статус вместо пустого экрана без объяснений (см.
+_on_builds_loaded()).
 """
 from PyQt6.QtCore import Qt, QThread, QSize
 from PyQt6.QtGui import QCursor, QFont, QPixmap
@@ -59,12 +60,6 @@ class BuildTile(QFrame):
         name.setStyleSheet("color: #eee; background: transparent; border: none;")
         name.setWordWrap(True)
         v.addWidget(name)
-
-        if build.version:
-            ver = QLabel(build.version)
-            ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            ver.setStyleSheet("color: #888; background: transparent; border: none; font-size: 9pt;")
-            v.addWidget(ver)
 
     def set_poster(self, data: bytes):
         try:
@@ -167,7 +162,10 @@ class CarouselWindow(QWidget):
 
     def _on_builds_loaded(self, builds: list):
         if not builds:
-            self.status_label.setText("Не удалось загрузить список сборок — проверьте соединение")
+            self.status_label.setText(
+                "Сборок пока нет, либо не удалось связаться с панелью — "
+                "проверьте соединение и повторите запуск"
+            )
             return
         self.status_label.setText(f"Доступно сборок: {len(builds)}")
 

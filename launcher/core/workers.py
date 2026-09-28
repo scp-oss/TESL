@@ -3,78 +3,64 @@
 Все QThread-воркеры лаунчера в одном модуле.
 """
 import concurrent.futures
-import hashlib
-import json
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
-from urllib.parse import quote
+from typing import Optional
 
-import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
-import config as _config   # для MANIFEST_CHUNK_DB_CACHE — см. комментарий ниже
-from config import MAX_WORKERS, CHUNK_MAX_WORKERS, DAV_BASE_URL, DAV_USERNAME
-from core.depot_client import DepotClient, _sha256
-from core.chunk_manifest_db import read_manifest_db
+import config as _config
+from config import MAX_WORKERS, CHUNK_MAX_WORKERS
+from core.depot_client import _sha256
+from core.chunk_manifest_db import FileEntry, ChunkInfo
 from core.chunk_installer import ChunkInstaller
+from core.panel_client import PanelDepotClient
 
 
-# ── Chunk-манифест — общее для DownloadWorker и VerifyWorker ───────────────────
+# ── Манифест сборки с панели — общее для DownloadWorker и VerifyWorker ────────
+# **2026-09-28: заменяет _get_version_manifest_rel_path()/_load_chunk_manifest()
+# (WebDAV .db-компаньон)** — переход на TESL-Panel, см. CLAUDE.md "Переход на
+# TESL-Panel". Панель отдаёт РОВНО ОДНО текущее состояние на build_id
+# (`depot_manifest.json`, не набор версий с историей, как старый WebDAV
+# depot.json) — поэтому "версия" в новом протоколе значит "то, что сейчас
+# реально опубликовано для этой сборки", выбор версии из списка (были у
+# WebDAV combo_versions) больше не имеет смысла как отдельная фича; см.
+# VersionLoaderWorker ниже — синтезирует единственную псевдо-"версию"
+# ("build #N") ради обратной совместимости с существующим UI main_window.py
+# (комбобокс/кнопки install/update там не переписывались в этом заходе).
 
-def _get_version_manifest_rel_path(client: DepotClient, version_label: Optional[str]) -> Optional[str]:
-    """Находим путь к JSON-манифесту версии (info['manifest']) — нужен только
-    чтобы вычислить путь к её .db-компаньону, сам JSON тут не скачивается."""
-    index = client.fetch_depot_index()
-    if not index:
+def _load_panel_manifest(client: PanelDepotClient):
+    """Возвращает (entries, meta) — entries в ТОЧНО той же форме
+    (List[FileEntry] из core.chunk_manifest_db), которую уже ожидает
+    ChunkInstaller (её интерфейс не менялся вообще, см. её собственный
+    докстринг класса) — сам ChunkInstaller не знает и не должен знать,
+    что источник теперь панель, а не WebDAV .db-компаньон. None, если
+    сборка не найдена / манифест недоступен (сеть, ещё не публиковалась)."""
+    raw = client.fetch_manifest()
+    if raw is None:
         return None
-    if version_label is None:
-        current_key = index.get("current", {}).get("stable")
-        if not current_key:
-            return None
-        info = index.get("versions", {}).get(current_key)
-    else:
-        info = None
-        for release in index.get("versions", {}).values():
-            if release.get("label") == version_label:
-                info = release
-                break
-    return info.get("manifest") if info else None
-
-
-def _load_chunk_manifest(client: DepotClient, version_label: Optional[str]):
-    """
-    Возвращает (entries, meta), если у версии есть chunk-манифест
-    (компаньон .db), иначе None — версия опубликована по старому
-    "плоскому" протоколу (files/<rel_path>), вызывающему коду нужно
-    работать по нему.
-
-    Раньше эта логика жила только внутри DownloadWorker (установка) —
-    VerifyWorker ("Проверить файлы") о chunk-протоколе вообще не знал и
-    всегда пробовал старый DepotClient.fetch_manifest() (плоский
-    manifest.json). Для версии, опубликованной ТОЛЬКО через чанки (как
-    эта сборка), это либо честно проваливалось с "манифест недоступен"
-    (безопасно, ничего не трогает), либо — если на сервере завалялся
-    СТАРЫЙ manifest.json от версии до перехода на чанки — принимал его за
-    актуальный и посчитал бы почти все реально установленные 170К+
-    файлов "лишними", с реальным риском их удаления в цикле очистки.
-    Найдено и починено 2026-09-22 (живой репорт: лаунчер "схлопнулся" во
-    время "Проверить файлы" на chunk-based сборке). Вынесено в общую
-    функцию, чтобы у обоих воркеров было ровно одно определение "что
-    считается chunk-манифестом версии", не два копии, рискующие разойтись.
-    """
-    manifest_rel = _get_version_manifest_rel_path(client, version_label)
-    if not manifest_rel:
-        return None
-    db_bytes = client.fetch_manifest_db_bytes(manifest_rel)
-    if db_bytes is None:
-        return None
-    cache_path = _config.MANIFEST_CHUNK_DB_CACHE
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_bytes(db_bytes)
-    return read_manifest_db(cache_path)
+    entries = []
+    for path, info in raw.get("files", {}).items():
+        chunks = [
+            ChunkInfo(chunk_id=c["id"], offset=c["offset"], size=c["size"])
+            for c in info.get("chunks", [])
+        ]
+        # component="" — путь в depot_manifest.json уже полностью
+        # префиксован ("Skyrim/Data/Skyrim.esm", см. TESL-Manager::
+        # chunk_manager.py::scan_components()) — FileEntry.rel_out_path
+        # возвращает path как есть, когда component пуст.
+        entries.append(FileEntry(
+            component="", path=path,
+            size=info["size"], file_hash=info["hash"], chunks=chunks,
+        ))
+    meta = {
+        "build_number": raw.get("build_number"),
+        "channel":      raw.get("channel", ""),
+        "description":  raw.get("description", ""),
+    }
+    return entries, meta
 
 
 # ── Base ──────────────────────────────────────────────────────────────────────
@@ -111,49 +97,64 @@ class ThreadSafeWorker(QObject):
 # ── Version loader ────────────────────────────────────────────────────────────
 
 class VersionLoaderWorker(ThreadSafeWorker):
-    """Загружает список версий из depot.json."""
+    """Загружает сведения о текущей сборке с TESL-Panel.
+
+    **2026-09-28**: панель отдаёт РОВНО ОДНО текущее состояние на
+    build_id (`depot_manifest.json`) — нет истории версий/каналов, как
+    у старого WebDAV `depot.json` (`versions{}`+`current{}`). Вместо
+    того чтобы выбрасывать весь UI выбора версии из main_window.py
+    (большой, рискованный рефакторинг вне объёма этого захода — сам
+    выбор СБОРКИ уже переехал на уровень выше, в карусель), эмитит
+    список из ОДНОЙ синтетической "версии" (`"build #N"`, из
+    `depot_manifest.json`'s `build_number`) — тот же сигнальный
+    контракт (`versions_loaded: list[str]`, `current_version: str`),
+    что и раньше, комбобокс в main_window.py работает без изменений,
+    просто всегда с одним пунктом. `description` (текст релиза, см.
+    CLAUDE.md "Описание релиза") эмитится отдельным сигналом —
+    единственное реально НОВОЕ, что появилось здесь."""
 
     log             = pyqtSignal(str)
-    versions_loaded = pyqtSignal(list)    # [label, ...]
-    current_version = pyqtSignal(str)     # label текущей версии канала
+    versions_loaded = pyqtSignal(list)    # [label, ...] — сейчас всегда 0 или 1 элемент
+    current_version = pyqtSignal(str)     # label текущей (единственной) версии
+    description     = pyqtSignal(str)     # текст описания релиза (может быть пустым)
     finished        = pyqtSignal(bool)
 
     def __init__(self, channel: str = "stable"):
         super().__init__()
-        self.channel = channel
+        self.channel = channel   # оставлен для совместимости вызова — панель
+        # не различает каналы на этом уровне (публикующий контроль канала
+        # остаётся за TESL-Manager, здесь просто не на что ещё выбирать).
 
     def run(self):
         try:
-            self.log.emit("Загружаем список версий...")
-            client  = DepotClient()
-            index   = client.fetch_depot_index()
-
-            if not index:
-                self.log.emit("Не удалось загрузить depot.json")
+            build_id = _config.CURRENT_BUILD_ID
+            if not build_id:
+                self.log.emit("❌ Сборка не выбрана")
                 self.versions_loaded.emit([])
                 self.finished.emit(False)
                 return
 
-            versions_dict = index.get("versions", {})
-            releases = sorted(
-                versions_dict.values(),
-                key=lambda r: r.get("build_number", 0),
-                reverse=True,
-            )
-            labels = [r.get("label", "") for r in releases if r.get("label")]
-            self.versions_loaded.emit(labels)
+            self.log.emit("Загружаем сведения о сборке...")
+            client = PanelDepotClient(build_id)
+            try:
+                raw = client.fetch_manifest()
+            finally:
+                client.close()
 
-            # Текущая версия канала
-            current_key = index.get("current", {}).get(self.channel)
-            if current_key and current_key in versions_dict:
-                cur_label = versions_dict[current_key].get("label", "")
-                self.current_version.emit(cur_label)
-                self.log.emit(f"Текущая версия ({self.channel}): {cur_label}")
+            if not raw:
+                self.log.emit("Не удалось получить манифест сборки (ещё не публиковалась?)")
+                self.versions_loaded.emit([])
+                self.finished.emit(False)
+                return
 
-            self.log.emit(f"Загружено версий: {len(labels)}")
+            label = f"build #{raw.get('build_number', '?')}"
+            self.versions_loaded.emit([label])
+            self.current_version.emit(label)
+            self.description.emit(raw.get("description", "") or "")
+            self.log.emit(f"Текущая версия: {label}")
             self.finished.emit(True)
         except Exception as e:
-            self.log.emit(f"Ошибка загрузки версий: {e}")
+            self.log.emit(f"Ошибка загрузки сведений о сборке: {e}")
             self.versions_loaded.emit([])
             self.finished.emit(False)
 
@@ -162,13 +163,17 @@ class VersionLoaderWorker(ThreadSafeWorker):
 
 class DownloadWorker(ThreadSafeWorker):
     """
-    Скачивает файлы сборки с WebDAV depot.
-    Поддерживает resume, параллельную загрузку, верификацию.
+    Скачивает файлы сборки с TESL-Panel (build_id = config.CURRENT_BUILD_ID,
+    выбирается в карусели) через ChunkInstaller/PanelDepotClient — см.
+    CLAUDE.md "Переход на TESL-Panel". Всегда устанавливает ТЕКУЩЕЕ
+    опубликованное состояние сборки — панель не хранит историю версий,
+    как раньше хранил WebDAV depot.json.
 
     task dict:
       type: "install" | "verify_and_install" | "apply_version"
       local_dir: str
-      version_label: str | None  (None = текущая stable)
+      version_label: str | None  (принимается для совместимости с
+        main_window.py, больше ни на что не влияет — см. run())
     """
 
     log                    = pyqtSignal(str)
@@ -195,156 +200,53 @@ class DownloadWorker(ThreadSafeWorker):
 
     def run(self):
         try:
-            local_dir     = Path(self.task.get("local_dir", ""))
-            version_label = self.task.get("version_label")
+            local_dir = Path(self.task.get("local_dir", ""))
+            # version_label — оставлен в task dict вызывающим кодом
+            # (main_window.py не переписывался в этом заходе) но больше
+            # ничего не значит: у панели нет истории версий, всегда
+            # устанавливается ТЕКУЩЕЕ опубликованное состояние сборки
+            # (CURRENT_BUILD_ID, выбранной в карусели). См. класс-докстринг.
 
             if not local_dir:
                 self.log.emit("❌ Локальная папка не задана")
                 self.finished.emit(False)
                 return
-
-            local_dir.mkdir(parents=True, exist_ok=True)
-
-            self._client = DepotClient()
-
-            # Пробуем chunk-протокол (см. config.py "Chunk-based версии") —
-            # для версий, опубликованных как content-addressed чанки, а не
-            # плоские files/<rel_path>. Не найден компаньон manifest.db —
-            # обычный, ожидаемый случай, просто работаем по старому пути.
-            chunk_result = self._try_chunk_install(version_label, local_dir)
-            if chunk_result is not None:
-                self.finished.emit(chunk_result)
-                return
-
-            # Скачиваем манифест
-            self.log.emit("📥 Загружаем манифест...")
-            manifest = self._client.fetch_manifest(version_label)
-            if not manifest:
-                self.log.emit("❌ Не удалось получить манифест")
+            build_id = _config.CURRENT_BUILD_ID
+            if not build_id:
+                self.log.emit("❌ Сборка не выбрана")
                 self.finished.emit(False)
                 return
 
-            files: Dict[str, str] = manifest.get("files", {})
-            if not files:
+            local_dir.mkdir(parents=True, exist_ok=True)
+
+            self._client = PanelDepotClient(build_id)
+
+            loaded = _load_panel_manifest(self._client)
+            if loaded is None:
+                self.log.emit("❌ Не удалось получить манифест сборки")
+                self.finished.emit(False)
+                return
+            entries, meta = loaded
+            if not entries:
                 self.log.emit("⚠️ Манифест пуст")
                 self.finished.emit(True)
                 return
 
-            self._client.cache_manifest(manifest)
-            self.log.emit(f"📋 Файлов в манифесте: {len(files)}")
+            self.log.emit(f"📋 Build #{meta.get('build_number', '?')}, файлов: {len(entries)}")
 
-            # Определяем что нужно скачать
-            self.log.emit("🔍 Сравниваем с локальными файлами...")
-            to_dl, to_redl, ok = self._client.diff_with_local(files, local_dir)
-            total_download = len(to_dl) + len(to_redl)
-
-            self.log.emit(
-                f"К загрузке: {len(to_dl)}, "
-                f"к перекачке: {len(to_redl)}, "
-                f"в порядке: {len(ok)}"
+            installer = ChunkInstaller(
+                client=self._client,
+                local_dir=local_dir,
+                max_workers=CHUNK_MAX_WORKERS,
+                on_log=self.log.emit,
+                on_progress_max=self.progress_total_setmax.emit,
+                on_progress=self.progress_total.emit,
+                on_current=self.current_file.emit,
+                should_stop=self._should_stop,
+                wait_if_paused=self._wait_if_paused,
             )
-
-            if total_download == 0:
-                self.log.emit("✅ Все файлы актуальны")
-                self.finished.emit(True)
-                return
-
-            to_download_list = to_dl + to_redl
-            self.progress_total_setmax.emit(total_download)
-            self._done   = 0
-            self._start_t = time.time()
-            self._last_sample_t = self._start_t
-            self._last_sample_bytes = 0
-            self._smoothed_speed = 0.0
-            self._downloaded_bytes = 0
-
-            failed: List[str] = []
-            lock = threading.Lock()
-
-            def _download_one(rel_path: str) -> bool:
-                if self._should_stop():
-                    return False
-                self._wait_if_paused()
-
-                local_file = local_dir / Path(rel_path.replace("/", os.sep))
-                expected   = files.get(rel_path, "")
-
-                ok_flag, msg = self._client.download_file(
-                    rel_path   = rel_path,
-                    local_path = local_file,
-                    expected_hash = expected,
-                    stop_fn    = self._should_stop,
-                    pause_fn   = self._wait_if_paused,
-                )
-
-                with lock:
-                    self._done += 1
-                    self.progress_total.emit(self._done)
-
-                    # Скорость — раньше слалась ОТДЕЛЬНЫМ сигналом
-                    # (speed_update) прямо в прокручиваемый лог, раз на
-                    # каждый файл, без троттлинга — на установке с тысячами
-                    # мелких файлов это забивало лог стеной из "⬇ X MB/s"
-                    # (прямая жалоба пользователя 2026-09-22, тот же класс
-                    # проблемы уже чинился для chunk-протокола, см.
-                    # core/chunk_installer.py::install()). Теперь скорость —
-                    # часть той же строки, что и current_file, которая уже
-                    # обновляется НА МЕСТЕ (progress.setFormat(), не append) —
-                    # отдельного сигнала/дублирования в лог больше нет.
-                    #
-                    # Скользящее окно, не среднее за всю установку с самого
-                    # начала — тот же фикс и та же причина, что в
-                    # core/chunk_installer.py::install() (см. его комментарий
-                    # у last_sample_t/smoothed_dl_speed): усреднение "с
-                    # начала" может застрять на старом низком значении
-                    # надолго даже после того, как реальная скорость
-                    # выросла. Заодно — раньше здесь на КАЖДЫЙ файл заново
-                    # суммировались размеры ВСЕХ уже скачанных файлов
-                    # (O(n) на файл, O(n²) в сумме) — теперь просто
-                    # прибавляем размер текущего файла к бегущему счётчику.
-                    if local_file.exists():
-                        self._downloaded_bytes += local_file.stat().st_size
-
-                    now = time.time()
-                    sample_dt = now - self._last_sample_t
-                    if sample_dt >= 0.5:
-                        inst = (self._downloaded_bytes - self._last_sample_bytes) / sample_dt
-                        alpha = 0.3
-                        self._smoothed_speed = inst if self._smoothed_speed == 0 else (
-                            alpha * inst + (1 - alpha) * self._smoothed_speed)
-                        self._last_sample_t = now
-                        self._last_sample_bytes = self._downloaded_bytes
-
-                    pct = int(self._done / total_download * 100) if total_download else 100
-                    self.current_file.emit(
-                        f"{pct}% — ⬇ {self._smoothed_speed / 1024 / 1024:.1f} MB/s — {rel_path}"
-                    )
-
-                if not ok_flag:
-                    self.log.emit(f"❌ {msg}")
-                    with lock:
-                        failed.append(rel_path)
-                return ok_flag
-
-            optimal = min(MAX_WORKERS, 8)
-            self.log.emit(f"⬇️ Скачиваем {total_download} файлов ({optimal} потоков)...")
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=optimal) as pool:
-                futures = {pool.submit(_download_one, p): p for p in to_download_list}
-                for future in concurrent.futures.as_completed(futures):
-                    if self._should_stop():
-                        for f in futures:
-                            f.cancel()
-                        self.log.emit("⏹ Загрузка остановлена")
-                        self.finished.emit(False)
-                        return
-
-            if failed:
-                self.log.emit(f"❌ Не загружено {len(failed)} файлов")
-                self.finished.emit(False)
-            else:
-                self.log.emit(f"✅ Загрузка завершена: {total_download} файлов")
-                self.finished.emit(True)
+            ok = installer.install(entries)
+            self.finished.emit(ok)
 
         except Exception as e:
             import traceback
@@ -353,47 +255,6 @@ class DownloadWorker(ThreadSafeWorker):
         finally:
             if self._client:
                 self._client.close()
-
-    # ── Chunk-протокол (см. config.py "Chunk-based версии") ─────────────────────
-    # Обнаружение манифеста (_get_version_manifest_rel_path/_load_chunk_manifest)
-    # теперь общие module-level функции в начале файла — используются и
-    # DownloadWorker (здесь), и VerifyWorker, чтобы у обоих воркеров было
-    # ровно одно определение "что считается chunk-манифестом версии".
-
-    def _try_chunk_install(self, version_label: Optional[str], local_dir: Path) -> Optional[bool]:
-        """
-        Возвращает None, если для этой версии нет chunk-манифеста (компаньона
-        .db) — значит нужно работать по обычному "плоскому" пути (files/<rel>).
-        Возвращает True/False, если реально запустили chunk-установку.
-
-        Сама загрузка/сборка/верификация — в `core.chunk_installer.ChunkInstaller`
-        (без Qt-зависимости, юнит-тестируется отдельно) — этот метод только
-        находит манифест и прокидывает Qt-сигналы в его колбэки.
-        """
-        try:
-            loaded = _load_chunk_manifest(self._client, version_label)
-        except Exception as e:
-            self.log.emit(f"❌ Не удалось прочитать chunk-манифест: {e}")
-            return False
-        if loaded is None:
-            return None
-        entries, meta = loaded
-
-        self.log.emit("📦 Обнаружен chunk-манифест — устанавливаем напрямую из chunks/ на сервере")
-        self.log.emit(f"📋 Версия по chunk-манифесту: {meta.get('version_key', '?')}")
-
-        installer = ChunkInstaller(
-            client=self._client,
-            local_dir=local_dir,
-            max_workers=CHUNK_MAX_WORKERS,
-            on_log=self.log.emit,
-            on_progress_max=self.progress_total_setmax.emit,
-            on_progress=self.progress_total.emit,
-            on_current=self.current_file.emit,
-            should_stop=self._should_stop,
-            wait_if_paused=self._wait_if_paused,
-        )
-        return installer.install(entries)
 
 
 # ── Verify worker ─────────────────────────────────────────────────────────────
@@ -414,130 +275,38 @@ class VerifyWorker(ThreadSafeWorker):
         try:
             self.log.emit("Начинаем проверку файлов...")
 
-            client = DepotClient()
-
-            # Chunk-протокол — проверяем ПЕРВЫМ, до старого плоского пути.
-            # Без этой проверки verify для chunk-based сборки либо честно
-            # проваливался ("манифест недоступен", безопасно), либо — если
-            # на сервере завалялся старый manifest.json от версии ДО
-            # перехода на чанки — принял бы его за актуальный и посчитал
-            # бы почти все реально установленные 170К+ файлов "лишними",
-            # с реальным риском их удаления в цикле очистки ниже. Живой
-            # репорт 2026-09-22: лаунчер "схлопнулся" во время "Проверить
-            # файлы" на chunk-based сборке — это и есть тот сценарий.
-            try:
-                loaded = _load_chunk_manifest(client, None)
-            except Exception as e:
-                self.log.emit(f"⚠️ Не удалось проверить chunk-манифест ({e}) — пробуем старый протокол")
-                loaded = None
-
-            if loaded is not None:
-                entries, meta = loaded
-                self.log.emit(f"📦 Обнаружен chunk-манифест — версия {meta.get('version_key', '?')}")
-                self._run_chunk_verify(client, entries)
-                return
-
-            manifest = client.fetch_manifest()
-
-            if not manifest:
-                # Пробуем кэш
-                manifest = client.load_cached_manifest()
-                if not manifest:
-                    self.log.emit("❌ Манифест недоступен")
-                    self.finished.emit(False, 0, 0, 0)
-                    return
-
-            client.cache_manifest(manifest)
-            files = manifest.get("files", {})
-            total = len(files)
-            self.log.emit(f"Файлов в манифесте: {total}")
-
-            # Удаляем лишние
-            self.log.emit("Поиск лишних файлов...")
-            deleted = 0
-            manifest_paths = {
-                str(Path(p.replace("/", os.sep))) for p in files
-            }
-            for f in self.local_dir.rglob("*"):
-                if self._should_stop():
-                    self.finished.emit(False, 0, 0, 0)
-                    return
-                if f.is_file():
-                    rel = str(f.relative_to(self.local_dir))
-                    if rel not in manifest_paths:
-                        try:
-                            f.unlink()
-                            deleted += 1
-                        except Exception:
-                            pass
-
-            # Проверяем хэши
-            self.log.emit("Проверка хэшей...")
-            to_dl, to_redl = [], []
-            checked = 0
-            self._start_t = time.time()
-
-            file_items = list(files.items())
-
-            def _check_one(item):
-                rel_path, hash_str = item
-                if self._should_stop():
-                    return None
-                self._wait_if_paused()
-                local = self.local_dir / Path(rel_path.replace("/", os.sep))
-                if not local.exists():
-                    return ("missing", rel_path)
-                expected = hash_str.replace("sha256:", "").strip()
-                actual   = _sha256(local)
-                if actual != expected:
-                    return ("corrupted", rel_path)
-                return ("ok", rel_path)
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                futures = {pool.submit(_check_one, item): item for item in file_items}
-                for future in concurrent.futures.as_completed(futures):
-                    if self._should_stop():
-                        self.finished.emit(False, 0, 0, 0)
-                        return
-
-                    result = future.result()
-                    if result is None:
-                        continue
-
-                    status, path = result
-                    checked += 1
-
-                    elapsed = time.time() - self._start_t
-                    remaining = total - checked
-                    eta = ""
-                    if checked > 0 and elapsed > 0:
-                        rate = checked / elapsed
-                        eta  = _fmt_eta(remaining / rate if rate > 0 else 0)
-
-                    self.progress.emit(checked, total, eta)
-
-                    if status == "missing":
-                        to_dl.append(path)
-                    elif status == "corrupted":
-                        to_redl.append(path)
-
-            if self._should_stop():
+            build_id = _config.CURRENT_BUILD_ID
+            if not build_id:
+                self.log.emit("❌ Сборка не выбрана")
                 self.finished.emit(False, 0, 0, 0)
                 return
 
-            self.log.emit(
-                f"Готово: к загрузке {len(to_dl)}, "
-                f"к перекачке {len(to_redl)}, "
-                f"удалено лишних {deleted}"
-            )
-            self.finished.emit(True, len(to_dl), len(to_redl), deleted)
+            client = PanelDepotClient(build_id)
+            try:
+                loaded = _load_panel_manifest(client)
+            except Exception as e:
+                self.log.emit(f"❌ Не удалось прочитать манифест сборки: {e}")
+                self.finished.emit(False, 0, 0, 0)
+                return
+
+            if loaded is None:
+                self.log.emit("❌ Манифест недоступен")
+                self.finished.emit(False, 0, 0, 0)
+                return
+
+            entries, meta = loaded
+            self.log.emit(f"📦 Build #{meta.get('build_number', '?')}")
+            try:
+                self._run_chunk_verify(client, entries)
+            finally:
+                client.close()
 
         except Exception as e:
             import traceback
             self.log.emit(f"Ошибка проверки: {e}\n{traceback.format_exc()}")
             self.finished.emit(False, 0, 0, 0)
 
-    def _run_chunk_verify(self, client: DepotClient, entries) -> None:
+    def _run_chunk_verify(self, client: PanelDepotClient, entries) -> None:
         """
         Проверка chunk-based сборки — тот же цикл (ThreadPoolExecutor,
         прогресс/пауза/отмена), что у флэт-протокола выше, только по
@@ -623,19 +392,27 @@ class VerifyWorker(ThreadSafeWorker):
 # ── Poster loader ─────────────────────────────────────────────────────────────
 
 class PosterLoader(ThreadSafeWorker):
-    """Фоново скачивает постер."""
+    """Фоново скачивает постер ТЕКУЩЕЙ (выбранной в карусели) сборки —
+    см. BuildsLoaderWorker выше за отдельный, недолговечный путь загрузки
+    постеров ВСЕХ сборок для самой карусели; здесь — тот же файл, но для
+    уже открытого главного окна одной конкретной сборки."""
     log     = pyqtSignal(str)
     loaded  = pyqtSignal(bytes)
     failed  = pyqtSignal()
 
     def run(self):
         try:
-            client = DepotClient()
-            data   = client.fetch_poster(on_log=self.log.emit)
+            build_id = _config.CURRENT_BUILD_ID
+            if not build_id:
+                self.failed.emit()
+                return
+            client = PanelDepotClient(build_id)
+            data   = client.fetch_poster()
             client.close()
             if data:
                 self.loaded.emit(data)
             else:
+                self.log.emit("Постер: не найден на панели")
                 self.failed.emit()
         except Exception as e:
             self.log.emit(f"Постер: неожиданная ошибка — {e}")
@@ -659,7 +436,6 @@ class BuildsLoaderWorker(ThreadSafeWorker):
 
     def run(self):
         from core.builds import list_builds
-        from core.depot_client import fetch_poster_bytes
         try:
             builds = list_builds(log=self.log.emit)
         except Exception as e:
@@ -667,10 +443,21 @@ class BuildsLoaderWorker(ThreadSafeWorker):
             builds = []
         self.loaded.emit(builds)
 
+        # Постер каждой сборки — свой недолговечный PanelDepotClient (та
+        # же логика, что раньше была у fetch_poster_bytes(): карусель
+        # показывает миниатюры ВСЕХ сборок сразу, до того как какая-либо
+        # из них станет "активной" через config.activate_build() — нет
+        # диска-кэша здесь вообще, каждый показ карусели качает заново;
+        # если станет проблемой при большом числе сборок — отдельная
+        # доработка (кэш по build_id), не сейчас).
         for b in builds:
             if self._should_stop():
                 return
-            data = fetch_poster_bytes(b.remote_path, on_log=self.log.emit)
+            client = PanelDepotClient(b.build_id)
+            try:
+                data = client.fetch_poster()
+            finally:
+                client.close()
             if data:
                 self.poster_loaded.emit(b.name, data)
 

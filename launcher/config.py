@@ -39,6 +39,37 @@ BUILD_NAME     = "TESVAE"
 BUILD_DATA_DIR = APPDATA_DIR / BUILD_NAME
 BUILD_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── TESL-Panel (scp-oss/TESL-Panel) — источник депо, 2026-09-28 ───────────────
+# Прямой запрос пользователя: "рефакторинг и адаптация лаунчера под
+# существующую панель", уточнено явным выбором — ПОЛНОСТЬЮ перейти на
+# TESL-Panel как источник сборок/депо, не держать WebDAV вторым
+# источником рядом. См. core/panel_client.py за протокол/обоснование.
+# WebDAV (DAV_* ниже) НЕ убран — остаётся для крэш-/debug-логов
+# (core/crash_logger.py) и патчера Skyrim (core/patcher.py), ни то ни
+# другое не входило в этот запрос.
+#
+# ВСЕ read-эндпоинты панели публичны (не Basic Auth, как WebDAV) —
+# токен здесь не нужен вообще.
+#
+# PANEL_BASE_URL НЕ ПОДТВЕРЖДЁН реальным доменом — в отличие от
+# DEPOT_REMOTE_PATH/CRASH_LOG_REMOTE_PATH (см. "Известные несостыковки"
+# ниже), это не путь внутри уже известного домена, а сам домен панели
+# целиком, а её публичный адрес (PUBLIC_BASE_URL) задаётся оператором
+# через ENV при разворачивании (TESL-Panel::panel/config.py,
+# TESL_PANEL_DOMAIN) — не хранится в её собственном репозитории и не
+# было подтверждено пользователем в сессии, где писалась эта правка.
+# Задать через ENV (TESL_PANEL_URL) или прямо здесь константой, когда
+# реальный домен подтвердится — сам код ничего больше не должен знать
+# о происхождении этого значения (тот же принцип, что DAV_BASE_URL).
+PANEL_BASE_URL = os.getenv("TESL_PANEL_URL", "").rstrip("/")
+
+# Ключ (build_id, реальный UUID на панели) выбранной сборки — заполняется
+# activate_build() при выборе плитки в карусели. Пустая строка — сборка
+# ещё не выбрана (до карусели). Замена DEPOT_REMOTE_PATH-адресации
+# сборки WebDAV-эры — там "какая сборка" кодировалось путём на сервере,
+# здесь это её собственный ключ в TESL-Panel::builds_db.py.
+CURRENT_BUILD_ID = ""
+
 # ── WebDAV ────────────────────────────────────────────────────────────────────
 # Базовый URL WebDAV (Nextcloud). Учётка read-only, общая для всех клиентов —
 # любой, кто соберёт .exe, может её извлечь (это ожидаемо для этой архитектуры,
@@ -270,18 +301,23 @@ def activate_build(build) -> None:
     Переключает "текущую" сборку на выбранную в карусели (см.
     ui/carousel_window.py, core/builds.py::Build) — живьём меняет модульные
     константы этого файла. `build` — любой объект с атрибутами
-    `.name`/`.remote_path` (core.builds.Build).
+    `.build_id`/`.name` (core.builds.Build).
+
+    **2026-09-28: DEPOT_REMOTE_PATH заменён на CURRENT_BUILD_ID** — с
+    переходом на TESL-Panel сборка адресуется своим реальным ключом
+    (build_id, UUID в TESL-Panel::builds_db.py), а не путём на WebDAV.
+    См. CLAUDE.md "Переход на TESL-Panel".
 
     ВАЖНО, та же ловушка, что уже чинилась этим сеансом для DAV_PASSWORD
     (см. CLAUDE.md): любой код, который читает эти константы через
-    `from config import DEPOT_REMOTE_PATH`/`MANIFEST_CACHE`/etc. (имя
+    `from config import CURRENT_BUILD_ID`/`MANIFEST_CACHE`/etc. (имя
     попадает в локальную область модуля при импорте), НЕ увидит смену
     сборки — такой импорт замораживает значение на момент импорта. Только
     код, который делает `import config as _config` и читает
-    `_config.DEPOT_REMOTE_PATH` и т.п. ЖИВЬЁМ на момент вызова, подхватит
-    переключение. core/depot_client.py и core/workers.py уже переведены на
+    `_config.CURRENT_BUILD_ID` и т.п. ЖИВЬЁМ на момент вызова, подхватит
+    переключение. core/panel_client.py и core/workers.py уже переведены на
     этот паттерн для всех констант, которые меняет эта функция — если
-    добавляется новый потребитель DEPOT_REMOTE_PATH/BUILD_NAME/
+    добавляется новый потребитель CURRENT_BUILD_ID/BUILD_NAME/
     BUILD_DATA_DIR/MANIFEST_CACHE/POSTER_CACHE/MANIFEST_CHUNK_DB_CACHE/
     SHORTCUT_ICON_CACHE, та же дисциплина обязательна.
 
@@ -290,11 +326,11 @@ def activate_build(build) -> None:
     лету" при уже открытом главном окне не поддерживается и не нужно —
     сменить сборку можно только перезапуском карусели.
     """
-    global BUILD_NAME, DEPOT_REMOTE_PATH, BUILD_DATA_DIR
+    global BUILD_NAME, CURRENT_BUILD_ID, BUILD_DATA_DIR
     global MANIFEST_CACHE, POSTER_CACHE, MANIFEST_CHUNK_DB_CACHE, SHORTCUT_ICON_CACHE
 
     BUILD_NAME        = build.name
-    DEPOT_REMOTE_PATH = build.remote_path
+    CURRENT_BUILD_ID  = build.build_id
     BUILD_DATA_DIR     = APPDATA_DIR / BUILD_NAME
     BUILD_DATA_DIR.mkdir(parents=True, exist_ok=True)
 

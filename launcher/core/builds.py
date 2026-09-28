@@ -3,66 +3,53 @@
 Build — одна доступная для установки сборка, показывается плиткой в
 карусели на старте лаунчера (см. ui/carousel_window.py).
 
-Сейчас реально существует ровно одна сборка (TESVAE, зашита константами
-в config.py). Реестр на сервере (config.BUILDS_REGISTRY_PATH) ещё НЕ
-подтверждён — list_builds() откатывается на эту единственную сборку, если
-реестра нет (обычный, ожидаемый на сегодня случай, не ошибка). Как только
-реестр появится на сервере — подхватится сам, без изменений в коде здесь.
+**2026-09-28: источник — TESL-Panel, не WebDAV builds.json.** Прямой
+запрос пользователя ("рефакторинг и адаптация лаунчера под
+существующую панель"), уточнено выбором — полностью перейти на
+TESL-Panel, не держать WebDAV builds.json вторым источником. Реестр
+теперь — GET /api/builds (публичный, см. core/panel_client.py), реальный
+ключ сборки — build_id (UUID из TESL-Panel::builds_db.py), а не путь на
+WebDAV. Нет фолбэка на единственную "зашитую" сборку, как раньше
+(_default_build()) — WebDAV убран как источник совсем, если панель
+недоступна/пуста, список пуст, это честно отражает реальность (см.
+ui/carousel_window.py за то, как это показывается пользователю).
 """
 from dataclasses import dataclass
 from typing import List
 
-import config as _config
-from core.depot_client import fetch_builds_registry
+from core import panel_client
 
 
 @dataclass
 class Build:
-    name:        str            # техническое имя (= config.BUILD_NAME для неё, папка кэша в APPDATA)
-    label:       str            # отображаемое имя на плитке карусели
-    remote_path: str            # путь на WebDAV относительно DAV_BASE_URL (= config.DEPOT_REMOTE_PATH для неё)
-    version:     str = ""       # опционально — короткая подпись под названием (напр. текущая версия), если реестр её даёт
-
-
-def _default_build() -> Build:
-    """Единственная сборка, зашитая в config.py сейчас — фолбэк, пока
-    реестра builds.json на сервере нет (см. модульный докстринг)."""
-    return Build(
-        name=_config.BUILD_NAME,
-        label=_config.BUILD_NAME,
-        remote_path=_config.DEPOT_REMOTE_PATH,
-    )
+    build_id: str            # реальный ключ на TESL-Panel (builds_db.py)
+    name:     str             # техническое имя (= TESL-Panel's build.name, папка кэша в APPDATA)
+    label:    str             # отображаемое имя на плитке карусели (пока = name — панель
+                               # не отдаёт отдельного "label" сейчас, в отличие от старого
+                               # WebDAV builds.json реестра)
 
 
 def list_builds(log=print) -> List[Build]:
     """
-    Возвращает список сборок для карусели. Всегда возвращает хотя бы одну
-    (см. _default_build()) — карусель никогда не остаётся пустой экраном,
-    даже если реестр на сервере отсутствует или битый.
+    Возвращает список сборок для карусели — пустой список (не None),
+    если панель недоступна или сборок ещё нет; panel_client.list_builds()
+    уже сама трактует сеть/HTTP-ошибки как штатный исход и логирует
+    причину через `log`.
     """
-    registry = fetch_builds_registry(on_log=log)
-    if not registry:
-        log(f"Реестр сборок (builds.json) не найден на сервере — показываем текущую сборку ({_config.BUILD_NAME})")
-        return [_default_build()]
+    raw = panel_client.list_builds(on_log=log)
+    if not raw:
+        log("Панель не вернула ни одной сборки (сеть недоступна или сборок пока нет)")
+        return []
 
     builds: List[Build] = []
-    for entry in registry:
+    for entry in raw:
         try:
-            name        = entry["name"]
-            remote_path = entry["remote_path"]
+            build_id = entry["id"]
+            name     = entry["name"]
         except (KeyError, TypeError):
-            log(f"⚠️ Пропускаю некорректную запись в реестре сборок (нет name/remote_path): {entry}")
+            log(f"⚠️ Пропускаю некорректную запись реестра сборок (нет id/name): {entry}")
             continue
-        builds.append(Build(
-            name=name,
-            label=entry.get("label", name),
-            remote_path=remote_path,
-            version=entry.get("version", ""),
-        ))
+        builds.append(Build(build_id=build_id, name=name, label=name))
 
-    if not builds:
-        log("Реестр сборок пуст или все записи битые — показываем текущую сборку")
-        return [_default_build()]
-
-    log(f"Загружено сборок из реестра: {len(builds)}")
+    log(f"Загружено сборок с панели: {len(builds)}")
     return builds
