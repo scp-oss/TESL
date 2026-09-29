@@ -246,6 +246,14 @@ class DownloadWorker(ThreadSafeWorker):
                 wait_if_paused=self._wait_if_paused,
             )
             ok = installer.install(entries)
+            # Сводка ПРИЧИН отказа скачивания чанков (не одна строка на
+            # каждый — 2020 одинаковых строк были бы тем же анти-
+            # паттерном, что уже чинился для speed_update) — см.
+            # PanelDepotClient.chunk_errors за живой повод 2026-09-29
+            # ("не удалось скачать 2020 чанков" без единой зацепки).
+            error_summary = self._client.chunk_error_summary()
+            if error_summary:
+                self.log.emit(f"🔎 Причины отказов скачивания чанков: {error_summary}")
             self.finished.emit(ok)
 
         except Exception as e:

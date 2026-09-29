@@ -1,7 +1,24 @@
 # ==================== launcher/core/crash_logger.py ====================
 """
-CrashLogger — собирает крэш-логи Skyrim и отправляет на WebDAV.
-Адаптирован из carash_logger.py под depot-систему.
+CrashLogger — собирает крэш-логи Skyrim и лог отладки лаунчера, отправляет
+на TESL-Panel (`PUT /api/reports/<report_type>/<username>/<timestamp>/
+<filename>`, см. её CLAUDE.md "Разделы Отчёты и Дашборд"/
+"поправь отправку логов в панель").
+
+**2026-09-29: переезд с WebDAV на панель** (было — WebDAV MKCOL+PUT,
+`CRASH_LOG_REMOTE_PATH`/`DEBUG_LOG_REMOTE_PATH` в config.py, обе убраны).
+Живой повод: `MKCOL .../Staticfolders/DEBUG_Log/ → 403` — общий
+read-ориентированный WebDAV-аккаунт лаунчера (`DAV_USERNAME`) не имеет
+прав создавать НОВЫЕ папки в этой ветке Nextcloud (в отличие от
+`CRASH_Log`, созданной вручную задолго до этого движка) — серверные
+права, не чинится в клиентском коде. Панель уже держала готовый,
+специально под это ждущий эндпоинт (`"crash"`/`"debug_log"` — публичен,
+без Bearer, см. TESL-Panel::app.py::api_reports_upload за обоснование:
+токен депо в публичном .exe был бы катастрофой, отчёт — нет), так что
+переезд заодно СИЛЬНО упростил сам код — `storage.put_bytes()` на
+панели сам создаёт родительские папки при каждом PUT, никакого
+MKCOL-танца (`_make_dir`/`_make_dir_recursive`, обе удалены) больше не
+нужно.
 """
 import os
 import pathlib
@@ -10,13 +27,8 @@ from typing import Callable, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
-from requests.auth import HTTPBasicAuth
 
-import config as _config   # для DAV_PASSWORD — см. upload_files()
-from config import (
-    DAV_BASE_URL, DAV_USERNAME,
-    CRASH_LOG_REMOTE_PATH,
-)
+import config as _config
 
 
 # ── File collection ───────────────────────────────────────────────────────────
@@ -66,81 +78,34 @@ def collect_files(skyrim_dir: str, log: Callable[[str], None] = print) -> List[p
     return result
 
 
-# ── Upload ────────────────────────────────────────────────────────────────────
-
-def _make_dir(session: requests.Session, url: str, log):
-    r = session.request("MKCOL", url, timeout=15)
-    if r.status_code not in (200, 201, 204, 405):
-        raise RuntimeError(f"MKCOL {url} → {r.status_code}")
-
-
-def _make_dir_recursive(session: requests.Session, base_url: str, path_segments, log):
-    """
-    MKCOL каждого сегмента пути по очереди, от корня вниз — не только
-    последней папки. Живой баг 2026-09-22: DEBUG_LOG_REMOTE_PATH
-    ("Staticfolders/DEBUG_Log") — новая папка, которую этот код никогда
-    заранее не создавал (в отличие от CRASH_LOG_REMOTE_PATH, чья папка на
-    сервере уже существовала до этой фичи) — старый _make_dir() вызывался
-    только на `<remote_path>/<username>/`, молча ПРЕДПОЛАГАЯ, что
-    <remote_path> САМ по себе уже существует. WebDAV MKCOL требует, чтобы
-    ВСЕ промежуточные коллекции уже существовали (RFC 4918) — если нет,
-    возвращает 409, а не создаёт их автоматически (не "mkdir -p"). Итог:
-    первая попытка отправить лог отладки на новую, ещё не созданную вручную
-    на сервере папку стабильно проваливалась с 409, и без ручного создания
-    папки оператором никогда бы не заработала сама. MKCOL на уже
-    существующую коллекцию возвращает 405 (обрабатывается как успех в
-    _make_dir), так что повторные вызовы для уже существующих сегментов
-    (как у CRASH_Log) безопасны и дёшевы.
-    """
-    url = base_url.rstrip("/")
-    for seg in path_segments:
-        url = f"{url}/{seg}"
-        _make_dir(session, url + "/", log)
-
+# ── Upload (TESL-Panel) ──────────────────────────────────────────────────────
 
 def upload_files(
     username:    str,
     files:       List[pathlib.Path],
     log:         Callable[[str], None] = print,
-    server_url:  str = DAV_BASE_URL,
-    remote_path: str = CRASH_LOG_REMOTE_PATH,
-    dav_user:    str = DAV_USERNAME,
-    dav_pass:    Optional[str] = None,
+    report_type: str = "crash",
 ) -> Tuple[bool, str]:
     """
-    Загружает файлы на WebDAV в структуру:
-      <remote_path>/<username>/<timestamp>/
-    Возвращает (success, message).
+    PUT каждого файла по отдельности на
+      {PANEL_BASE_URL}/api/reports/<report_type>/<username>/<timestamp>/<filename>
+    (публичный эндпоинт, без токена — см. модульный докстринг). Один общий
+    `timestamp` на весь вызов (не на файл) — та же структура
+    `<username>/<timestamp>/` с несколькими файлами внутри, что была на
+    WebDAV, сохранена намеренно: `/admin/reports` на панели уже рассчитан
+    ровно на неё.
     """
     session = requests.Session()
-    # dav_pass=None -> config.DAV_PASSWORD живьём на момент вызова, не на
-    # момент импорта (см. depot_client.py::DepotClient.__init__ — та же правка).
-    effective_pass = dav_pass if dav_pass is not None else _config.DAV_PASSWORD
-    session.auth = HTTPBasicAuth(dav_user, effective_pass)
-    session.verify = True
-
-    timestamp  = datetime.now().strftime("%m.%d.%Y-%H.%M.%S")
-    base_url   = server_url.rstrip("/")
-    rp         = remote_path.strip("/")
-    user_url   = f"{base_url}/{rp}/{username}/"
-    folder_url = f"{user_url}{timestamp}/"
-
-    try:
-        # Каждый сегмент по очереди (remote_path -> username -> timestamp),
-        # не только последние два — см. _make_dir_recursive() за живой
-        # 409-баг, который это чинит. rp может содержать несколько
-        # сегментов сам по себе (напр. "1TB/TESS/Staticfolders/DEBUG_Log").
-        _make_dir_recursive(session, base_url, rp.split("/") + [username, timestamp], log)
-    except RuntimeError as e:
-        log(f"❌ {e}")
-        return False, str(e)
+    timestamp = datetime.now().strftime("%m.%d.%Y-%H.%M.%S")
+    base = _config.PANEL_BASE_URL.rstrip("/")
+    folder_url = f"{base}/api/reports/{report_type}/{quote(username, safe='')}/{timestamp}/"
 
     uploaded = []
     for f in files:
         try:
             with open(f, "rb") as fh:
                 url = folder_url + quote(f.name)
-                r   = session.put(url, data=fh, timeout=60)
+                r = session.put(url, data=fh, timeout=60)
             if r.status_code in (200, 201, 204):
                 log(f"✅ Загружен: {f.name}")
                 uploaded.append(f.name)
@@ -148,7 +113,6 @@ def upload_files(
                 log(f"❌ Ошибка {r.status_code} при загрузке {f.name}")
         except Exception as e:
             log(f"❌ {f.name}: {e}")
-
     session.close()
 
     if uploaded:

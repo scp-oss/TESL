@@ -5,13 +5,12 @@
 пользователя 2026-09-22: "если его включить будет лог от ланчере о
 установке весь лог консоли отправляться на сервер для нашего анализа".
 
-Переиспользует УЖЕ проверенный WebDAV-механизм крэш-репортов
-(core/crash_logger.py::upload_files()) вместо новой логики — та же
-структура <remote_path>/<username>/<timestamp>/, только путь другой
-(config.DEBUG_LOG_REMOTE_PATH, НЕ ПОДТВЕРЖДЁН реальным листингом — см. её
-докстринг в config.py, тот же класс "нужно сверить, когда появится первая
-реальная отправка", что раньше был у CRASH_LOG_REMOTE_PATH/DEPOT_REMOTE_PATH
-до их подтверждения).
+Переиспользует уже проверенный механизм крэш-репортов
+(core/crash_logger.py::upload_files()) — та же структура
+`<username>/<timestamp>/`, только `report_type="debug_log"` вместо
+`"crash"`. **2026-09-29: переехало вместе с крэш-репортами на
+TESL-Panel** — см. crash_logger.py's докстринг за живой повод
+(WebDAV `MKCOL DEBUG_Log/ → 403`, серверные права, не чинится тут).
 """
 import threading
 from typing import Callable
@@ -26,7 +25,7 @@ def _do_upload(username: str, reason: str, log: Callable[[str], None]):
         ok, msg = upload_files(
             username, [_config.LOG_FILE],
             log=log,
-            remote_path=_config.DEBUG_LOG_REMOTE_PATH,
+            report_type="debug_log",
         )
         log(f"🐞 {'Лог отладки отправлен' if ok else 'Не удалось отправить лог отладки'}: {msg}")
     except Exception as e:

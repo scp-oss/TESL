@@ -44,6 +44,7 @@ import hashlib
 import json
 import sqlite3
 import tempfile
+from collections import Counter
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -113,12 +114,31 @@ class PanelDepotClient:
     (см. её собственный докстринг класса: "любой объект с методом
     `download_chunk(chunk_id) -> Optional[bytes]`") — тот класс сам не
     меняется вообще, только транспорт под ним.
+
+    **`chunk_errors` (2026-09-29)** — живой инцидент: реальная установка
+    вернула "Не удалось скачать 2020 чанков" с абсолютно нулевой
+    зацепкой, ПОЧЕМУ — `download_chunk()` глотал ЛЮБую причину отказа
+    (таймаут, обрыв соединения, HTTP-статус, несовпадение sha256) в один
+    и тот же голый `None`, тот же класс "пустое сообщение скрывает
+    реальную причину", что уже чинился в этом репозитории для постера/
+    записи чанка на диск (см. CLAUDE.md). Теперь каждый отказ
+    инкрементирует `self.chunk_errors[reason]` (не льётся в лог на
+    КАЖДЫЙ чанк — 2020 одинаковых строк были бы тем же анти-паттерном,
+    что уже разбирался для `speed_update` — только счётчик, сводка
+    печатается ОДИН раз в конце — см. `core/workers.py::
+    DownloadWorker.run()`). Даёт наконец возможность отличить
+    "сервер/Cloudflare реально не смог отдать байты" (`timeout`/
+    `connection_error`/`http_5xx`) от "чанка там просто нет"
+    (`http_404`) от "битые данные дошли" (`sha256_mismatch`) — без этого
+    гипотеза "надо скачивать без прокси Cloudflare" остаётся ровно
+    гипотезой, не диагнозом.
     """
 
     def __init__(self, build_id: str, base_url: str = None):
         self.build_id = build_id
         self.base = (base_url or _config.PANEL_BASE_URL).rstrip("/")
         self.session = _session()
+        self.chunk_errors: "Counter[str]" = Counter()
         self._chunk_index: Optional[Dict[str, Tuple[str, int, int]]] = None
         self._chunk_index_lock = threading.Lock()
 
@@ -217,7 +237,12 @@ class PanelDepotClient:
         (chunk_index.db + Range-GET на pack) первым; если чанка там нет
         (легаси-сборка без упаковки, use_packs=False на публикации) —
         падает обратно на прямой путь chunks/<xx>/<id>, тот же
-        URL-паттерн, что WebDAV-DepotClient уже использовал."""
+        URL-паттерн, что WebDAV-DepotClient уже использовал.
+
+        Каждый отказ инкрементирует `self.chunk_errors[reason]` вместо
+        того чтобы молча слиться в один и тот же `None` — см. докстринг
+        класса за живой повод (2020 "не удалось скачать" без единой
+        зацепки, почему)."""
         index = self._ensure_chunk_index()
         loc = index.get(chunk_id)
         if loc is not None:
@@ -229,16 +254,49 @@ class PanelDepotClient:
                     data = r.content
                     if hashlib.sha256(data).hexdigest() == chunk_id:
                         return data
-            except Exception:
-                pass
-            return None
+                    self.chunk_errors["sha256_mismatch"] += 1
+                    return None
+                self.chunk_errors[f"http_{r.status_code}"] += 1
+                return None
+            except requests.exceptions.Timeout:
+                self.chunk_errors["timeout"] += 1
+                return None
+            except requests.exceptions.ConnectionError:
+                self.chunk_errors["connection_error"] += 1
+                return None
+            except Exception as e:
+                self.chunk_errors[f"exception_{type(e).__name__}"] += 1
+                return None
         # Легаси, без упаковки — тот же путь, что и раньше на WebDAV.
-        data = self.get_bytes(f"chunks/{chunk_id[:2]}/{chunk_id}", timeout=120)
-        if data is None:
+        try:
+            r = self.session.get(
+                self._url(f"chunks/{chunk_id[:2]}/{chunk_id}"), timeout=120,
+            )
+        except requests.exceptions.Timeout:
+            self.chunk_errors["timeout"] += 1
             return None
+        except requests.exceptions.ConnectionError:
+            self.chunk_errors["connection_error"] += 1
+            return None
+        except Exception as e:
+            self.chunk_errors[f"exception_{type(e).__name__}"] += 1
+            return None
+        if r.status_code != 200:
+            self.chunk_errors[f"http_{r.status_code}"] += 1
+            return None
+        data = r.content
         if hashlib.sha256(data).hexdigest() != chunk_id:
+            self.chunk_errors["sha256_mismatch"] += 1
             return None
         return data
+
+    def chunk_error_summary(self) -> str:
+        """Одна строка вида 'timeout: 1800, http_404: 220' для итогового
+        лога — см. core/workers.py::DownloadWorker.run(). Пусто, если
+        отказов не было (обычный, ожидаемый случай)."""
+        if not self.chunk_errors:
+            return ""
+        return ", ".join(f"{reason}: {count}" for reason, count in self.chunk_errors.most_common())
 
     # ── Отдельные файлы (постер, documents/, patch/, patchs/) ────────────
 
