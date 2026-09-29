@@ -12,6 +12,14 @@ core/builds.py/core/panel_client.py), не WebDAV builds.json — карусел
 по умолчанию не осталось; при пустом ответе панели показывает
 понятный статус вместо пустого экрана без объяснений (см.
 _on_builds_loaded()).
+
+**Безрамочная "стеклянная" оболочка (см. ui/theme.py) — прямой запрос
+пользователя** после того, как реальный скрин показал обычное системное
+окно и плоские серые плитки, совсем не похожие на дизайн-макет: не
+проблема Python/Qt (там же спрашивалось, не взять ли другой язык под
+это) — просто до этого коммита из макета в код была перенесена только
+логика (автопостер/оверлей прогресса), не "оболочка" (безрамочное окно,
+кастомный тайтлбар со свернуть/закрыть, скруглённые плитки, скроллбар).
 """
 from PyQt6.QtCore import Qt, QThread, QSize
 from PyQt6.QtGui import QCursor, QFont, QPixmap
@@ -23,10 +31,14 @@ from PyQt6.QtWidgets import (
 import config as _config
 from config import get_asset_path
 from core.workers import BuildsLoaderWorker
+from ui.theme import (
+    make_frameless, wrap_in_card, TitleBar, SCROLLBAR_QSS,
+    TEXT, TEXT_2, TEXT_3, HAIRLINE,
+)
 
 
-TILE_W, TILE_H = 200, 280
-POSTER_W, POSTER_H = 180, 240
+TILE_W, TILE_H = 220, 300
+POSTER_W, POSTER_H = 200, 260
 
 
 class BuildTile(QFrame):
@@ -38,9 +50,12 @@ class BuildTile(QFrame):
         self._on_click = on_click
         self.setFixedSize(TILE_W, TILE_H)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setStyleSheet("""
-            BuildTile { background: #232323; border: 1px solid #3a3a3a; border-radius: 10px; }
-            BuildTile:hover { background: #2e2e2e; border-color: #6aa9ff; }
+        self.setStyleSheet(f"""
+            BuildTile {{
+                background: qlineargradient(x1:0, y1:0, x2:0.4, y2:1, stop:0 #26262b, stop:1 #1a1a1e);
+                border: 1px solid {HAIRLINE}; border-radius: 18px;
+            }}
+            BuildTile:hover {{ border-color: rgba(47, 143, 224, 140); }}
         """)
 
         v = QVBoxLayout(self)
@@ -50,7 +65,7 @@ class BuildTile(QFrame):
         self.poster = QLabel()
         self.poster.setFixedSize(POSTER_W, POSTER_H)
         self.poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.poster.setStyleSheet("background: #1a1a1a; border-radius: 6px; color: #666;")
+        self.poster.setStyleSheet(f"background: #1a1a1a; border-radius: 14px; color: {TEXT_3};")
         # Автогенерированный постер сразу, а не текст-заглушка "..." — эта
         # же картинка и останется, если BuildsLoaderWorker для этой сборки
         # реального постера так и не пришлёт (poster_loaded просто не
@@ -64,7 +79,7 @@ class BuildTile(QFrame):
         name = QLabel(build.label)
         name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        name.setStyleSheet("color: #eee; background: transparent; border: none;")
+        name.setStyleSheet(f"color: {TEXT}; background: transparent; border: none;")
         name.setWordWrap(True)
         v.addWidget(name)
 
@@ -162,9 +177,14 @@ class CarouselWindow(QWidget):
         from PyQt6.QtGui import QIcon
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
-        self.resize(720, 420)
-        self.setMinimumSize(480, 360)
-        self.setStyleSheet("background: #1c1c1c;")
+        self.resize(768, 468)
+        self.setMinimumSize(528, 408)
+
+        # Безрамочное окно + одна "карточка"-подложка (реальный фон/
+        # скругление/тень) внутри — см. ui/theme.py за то, почему НЕ
+        # border-radius прямо на самом top-level окне.
+        make_frameless(self)
+        card = wrap_in_card(self, radius=22)
 
         self._tiles: dict = {}   # build.name -> BuildTile
         self.builds_worker = None   # хранится на self — та же ловушка PyQt6,
@@ -173,30 +193,33 @@ class CarouselWindow(QWidget):
         # без живой Python-ссылки рискует быть собрана сборщиком мусора до
         # того, как поток успеет вызвать run()).
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(14)
+        card_v = QVBoxLayout(card)
+        card_v.setContentsMargins(0, 0, 0, 0)
+        card_v.setSpacing(0)
 
-        title = QLabel("Выберите сборку")
-        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        title.setStyleSheet("color: #eee;")
-        root.addWidget(title)
+        title_bar = TitleBar(subtitle="Выберите сборку, чтобы продолжить")
+        card_v.addWidget(title_bar)
+
+        root = QVBoxLayout()
+        root.setContentsMargins(24, 16, 24, 20)
+        root.setSpacing(12)
+        card_v.addLayout(root)
 
         self.status_label = QLabel("Загрузка списка сборок...")
-        self.status_label.setStyleSheet("color: #888;")
+        self.status_label.setStyleSheet(f"color: {TEXT_2};")
         root.addWidget(self.status_label)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }" + SCROLLBAR_QSS)
 
         self.strip = QWidget()
         self.strip.setStyleSheet("background: transparent;")
         self.strip_layout = QHBoxLayout(self.strip)
         self.strip_layout.setContentsMargins(0, 0, 0, 0)
-        self.strip_layout.setSpacing(14)
+        self.strip_layout.setSpacing(16)
         self.strip_layout.addStretch()
         scroll.setWidget(self.strip)
         root.addWidget(scroll, 1)
