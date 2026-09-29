@@ -1708,6 +1708,29 @@ chunk_errors` (новый `Counter`) — каждый отказ `download_chunk
 Полный E2E-прогон установки (реальный HTTP, см. выше) прошёл без единой
 ошибки — регрессии в успешном пути нет.
 
+## `_sqlite3` фолбэк пропущен в `core/panel_client.py`/`core/chunk_manifest_db.py` при первой правке (2026-09-29)
+
+Живой инцидент, найден интеграционным тестом TESL-Panel (см. её
+CLAUDE.md "Сквозной интеграционный тест") на реальном сервере
+(`NETHUNTER-1`): `pack_writer.py`'s `ModuleNotFoundError: No module
+named '_sqlite3'` был исправлен в TESL-Manager (см. её CLAUDE.md), но
+`launcher_verify.py` (подпроцесс теста, импортирующий код ЭТОГО
+репозитория) упал с ТОЙ ЖЕ ошибкой на `import sqlite3` внутри
+`core/panel_client.py` — этот файл, и отдельно `core/chunk_manifest_
+db.py`, оба тоже держат bare `import sqlite3` (читают `manifest.db`/
+`chunk_index.db`), но не были задеты первым проходом фикса, который
+смотрел только на TESL-Manager.
+
+Исправлено тем же приёмом, что и везде в этом движке: `try: import
+sqlite3 / except ImportError: import pysqlite3 as sqlite3` в обоих
+файлах, `pysqlite3-binary>=0.5` добавлен в `requirements.txt` этого
+репозитория. **Урок**: при переносе одного и того же фикса между
+репозиториями одного проекта — грепать ВЕСЬ репозиторий на паттерн
+(`import sqlite3` без try/except), не только тот файл, что упал в
+конкретной трассировке первым — тот же класс промаха, что уже
+случался в этом файле для `DAV_BASE_URL`→`DEPOT_READ_BASE_URL`
+(см. "NameError в карусели сборок" выше).
+
 ## Стиль
 
 PyQt6, воркеры — `QThread` + `moveToThread`, сигналы `pyqtSignal` для

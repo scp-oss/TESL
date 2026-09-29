@@ -14,7 +14,13 @@ content-addressed чанки (`chunks/<xx>/<id>`), а не как плоские
 курсе изменений друг друга, если схема когда-нибудь поменяется.
 """
 
-import sqlite3
+try:
+    import sqlite3
+except ImportError:
+    # См. core/panel_client.py за полное обоснование (живой инцидент
+    # 2026-09-29) — тот же фолбэк во всех местах этого движка с bare
+    # `import sqlite3`.
+    import pysqlite3 as sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple

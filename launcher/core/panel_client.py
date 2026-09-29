@@ -42,7 +42,14 @@ GET /api/depot/<build_id>/<любой другой путь>  как есть �
 """
 import hashlib
 import json
-import sqlite3
+try:
+    import sqlite3
+except ImportError:
+    # Живой инцидент 2026-09-29: сервер без C-расширения `_sqlite3`
+    # (Python собран из исходников без libsqlite3-dev) — тот же
+    # фолбэк, что уже применён в TESL-Panel::builds_db.py и во всех
+    # трёх местах TESL-Manager с bare `import sqlite3`.
+    import pysqlite3 as sqlite3
 import tempfile
 from collections import Counter
 import threading
