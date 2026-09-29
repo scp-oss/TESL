@@ -104,7 +104,17 @@ class PosterWidget(QLabel):
             self.setText("Постер недоступен")
 
     def set_error(self):
-        self.setText("Постер\nнедоступен")
+        """Вызывается когда PosterLoader.failed сработал — постер либо не
+        загружен на панель для этой сборки вообще, либо не удалось его
+        скачать (оба случая panel_client.py::fetch_poster() сворачивает в
+        один Optional[bytes], см. её докстринг). Вместо текстовой заглушки —
+        автогенерированный постер (core/poster_fallback.py, прямой запрос
+        пользователя "автогенерация постеров сборок если постер не задан").
+        Живое (не замороженное импортом) значение BUILD_NAME — эта сборка
+        активируется config.activate_build() уже ПОСЛЕ импорта модуля."""
+        import config as _config
+        from core.poster_fallback import render_fallback_poster
+        self.setPixmap(render_fallback_poster(_config.BUILD_NAME, self.W, self.H))
 
 
 # ── UIUpdater ─────────────────────────────────────────────────────────────────

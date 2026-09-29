@@ -51,7 +51,14 @@ class BuildTile(QFrame):
         self.poster.setFixedSize(POSTER_W, POSTER_H)
         self.poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.poster.setStyleSheet("background: #1a1a1a; border-radius: 6px; color: #666;")
-        self.poster.setText("...")
+        # Автогенерированный постер сразу, а не текст-заглушка "..." — эта
+        # же картинка и останется, если BuildsLoaderWorker для этой сборки
+        # реального постера так и не пришлёт (poster_loaded просто не
+        # эмитится, см. её докстринг) — то есть "если постер не задан",
+        # прямой запрос пользователя. set_poster() ниже перекрывает её,
+        # если/когда реальный постер всё же загрузится.
+        from core.poster_fallback import render_fallback_poster
+        self.poster.setPixmap(render_fallback_poster(build.label or build.name, POSTER_W, POSTER_H))
         v.addWidget(self.poster, alignment=Qt.AlignmentFlag.AlignCenter)
 
         name = QLabel(build.label)
@@ -60,6 +67,57 @@ class BuildTile(QFrame):
         name.setStyleSheet("color: #eee; background: transparent; border: none;")
         name.setWordWrap(True)
         v.addWidget(name)
+
+        # Оверлей прогресса загрузки — поднимается снизу поверх постера,
+        # тот же приём, что у плиток Microsoft Store при установке
+        # приложения ("мини прогресбар цветом, винда так умеет", прямой
+        # запрос пользователя). Дети self.poster (не самой плитки) —
+        # позиционируются вручную через setGeometry() внутри его
+        # координат, а не через layout. Скрыт по умолчанию (set_progress
+        # ещё не вызывался ни разу — см. её докстринг за то, что сейчас
+        # реально driving-сигнала для этого нет).
+        self._progress_overlay = QFrame(self.poster)
+        self._progress_overlay.setStyleSheet(
+            "background: rgba(47, 143, 224, 150); border: none; border-radius: 0;"
+        )
+        self._progress_overlay.setGeometry(0, POSTER_H, POSTER_W, 0)
+        self._progress_overlay.hide()
+
+        self._progress_label = QLabel(self.poster)
+        self._progress_label.setStyleSheet(
+            "color: white; font-weight: 600; font-size: 11px; background: transparent; border: none;"
+        )
+        self._progress_label.setFixedSize(60, 18)
+        self._progress_label.hide()
+
+    def set_progress(self, percent):
+        """percent: int (0-100) — доля загрузки, показать/обновить оверлей;
+        None — скрыть (сборка сейчас не скачивается).
+
+        ПРИМЕЧАНИЕ ДЛЯ СЛЕДУЮЩЕГО, КТО ЭТО ПОДКЛЮЧАЕТ: сейчас этот метод
+        никто не вызывает. В текущей архитектуре карусель ЗАКРЫВАЕТСЯ в
+        момент клика по плитке (main.py::_open_main_window — открывает
+        главное окно и сразу же `_carousel_window.close()`), а сама
+        загрузка идёт уже внутри него (core/workers.py::DownloadWorker) —
+        то есть плитка, для которой был бы виден этот оверлей, к началу
+        реальной загрузки уже не существует. Подключить его к живому
+        прогрессу значит держать карусель открытой (или воссоздавать её
+        состояние) во время установки — решение об архитектуре окон, не
+        только визуальный перенос макета, и здесь оно не принято
+        самостоятельно. Метод оставлен готовым и статически проверенным."""
+        if percent is None:
+            self._progress_overlay.hide()
+            self._progress_label.hide()
+            return
+        percent = max(0, min(100, int(percent)))
+        h = round(POSTER_H * percent / 100)
+        self._progress_overlay.setGeometry(0, POSTER_H - h, POSTER_W, h)
+        self._progress_overlay.show()
+        self._progress_overlay.raise_()
+        self._progress_label.setText(f"{percent}%")
+        self._progress_label.move(8, POSTER_H - 22)
+        self._progress_label.show()
+        self._progress_label.raise_()
 
     def set_poster(self, data: bytes):
         try:
