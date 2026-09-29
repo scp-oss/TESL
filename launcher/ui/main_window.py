@@ -138,6 +138,7 @@ class UpdaterUI(QWidget):
         self._is_closing     = False
         self._full_local_path = ""
         self._current_version = ""
+        self._version_meta = {}                # {label: {version_key,description,build_number,...}} — см. _on_version_meta_loaded()
         self._status_button_mode = "install"   # "install" | "update" | "play" | "cancel" | "resume" — см. _refresh_status_button()
         self._pending_install_target = None    # version_label, который качает текущий install/update-запуск
         self._current_task = None              # task-dict текущего DownloadWorker'а — см. _start_worker()/_toggle_pause()
@@ -476,6 +477,7 @@ class UpdaterUI(QWidget):
         self.version_worker.moveToThread(self.version_thread)
         self.version_worker.log.connect(self._append_log)
         self.version_worker.versions_loaded.connect(self._on_versions_loaded)
+        self.version_worker.version_meta_loaded.connect(self._on_version_meta_loaded)
         self.version_worker.current_version.connect(self._on_current_version)
         self.version_thread.started.connect(self.version_worker.run)
         self.version_thread.start()
@@ -487,6 +489,24 @@ class UpdaterUI(QWidget):
         else:
             self.combo_versions.addItem("Нет доступных версий")
         self._refresh_status_button()
+
+    def _on_version_meta_loaded(self, meta: dict):
+        """{label: {version_key,description,build_number,...}} — 2026-09-29,
+        см. VersionLoaderWorker.version_meta_loaded. Пустой словарь — либо
+        ошибка загрузки, либо сборка без истории версий (публиковалась до
+        того, как панель начала версионировать); в обоих случаях
+        install/update продолжают ставить ТЕКУЩУЮ версию (version_key=None,
+        см. _version_key_for()), как и до этой правки."""
+        self._version_meta = meta or {}
+
+    def _version_key_for(self, label: str) -> "str | None":
+        """None значит "текущая (последняя) версия" — тот же смысл, что
+        DownloadWorker.run() уже придаёт отсутствию version_key в task
+        dict. Используется везде, где task dict строится из выбора в
+        combo_versions — единственное место, которое резолвит метку в
+        реальный ключ, само DownloadWorker про метки не знает."""
+        v = self._version_meta.get(label)
+        return v.get("version_key") if v else None
 
     def _format_version_label(self, version: str) -> str:
         """"Текущая версия: X (лаунчер: <git-хэш>)" — хэш нужен, чтобы при
@@ -505,17 +525,15 @@ class UpdaterUI(QWidget):
         self._refresh_status_button()
         if not label or label in ("Загрузка...", "Нет доступных версий"):
             return
-        # Показываем заметки версии
-        from core.depot_client import DepotClient
-        try:
-            client = DepotClient()
-            info   = client.get_version_info(label)
-            client.close()
-            if info:
-                notes = info.get("notes", "Описание добавим позже")
-                self.lbl_version_info.setPlainText(notes)
-        except Exception:
-            pass
+        # 2026-09-29: раньше здесь спрашивался WebDAV DepotClient.
+        # get_version_info() — заметки по старому протоколу депо, никак
+        # не связанному с панелью (мёртвый код с момента перехода на
+        # TESL-Panel, просто никогда не убирался). Теперь описание
+        # берётся из _version_meta (см. _on_version_meta_loaded()) —
+        # реальный текст ИМЕННО выбранной версии, не только текущей.
+        v = self._version_meta.get(label)
+        notes = (v.get("description") if v else "") or "Описание отсутствует"
+        self.lbl_version_info.setPlainText(notes)
 
     # ── Poster loader ─────────────────────────────────────────────────────────
 
@@ -594,7 +612,11 @@ class UpdaterUI(QWidget):
         # (у этой сборки "current" в depot.json пуст — см. CLAUDE.md).
         self._pending_install_target = version or self._current_version or self.combo_versions.currentText()
 
-        task = {"type": "install", "local_dir": self._full_local_path, "version_label": version}
+        task = {
+            "type": "install", "local_dir": self._full_local_path,
+            "version_label": version,
+            "version_key": self._version_key_for(version) if version else None,
+        }
         self._start_worker(task)
 
     # ── Verify ────────────────────────────────────────────────────────────────
@@ -843,7 +865,7 @@ class UpdaterUI(QWidget):
             if not self._full_local_path:
                 return
         self._pending_install_target = self._current_version or self.combo_versions.currentText()
-        task = {"type": "install", "local_dir": self._full_local_path, "version_label": None}
+        task = {"type": "install", "local_dir": self._full_local_path, "version_label": None, "version_key": None}
         self._start_worker(task)
 
     def _update_to_selected(self):
@@ -855,11 +877,23 @@ class UpdaterUI(QWidget):
             if not self._full_local_path:
                 return
         self._pending_install_target = label
-        task = {"type": "install", "local_dir": self._full_local_path, "version_label": label}
+        task = {
+            "type": "install", "local_dir": self._full_local_path,
+            "version_label": label, "version_key": self._version_key_for(label),
+        }
         self._start_worker(task)
 
     def _rollback_to_selected(self):
-        self._update_to_selected()  # depot хранит все файлы — откат = установка старой версии
+        # 2026-09-29: раньше это было буквально то же самое, что
+        # "Обновить" — панель отдавала только текущую версию, "откат"
+        # ничем не отличался от установки. Теперь combo_versions реально
+        # содержит историю (см. VersionLoaderWorker) — выбор НЕ-первого
+        # пункта и клик по этой кнопке реально ставит СТАРУЮ версию через
+        # version_key (см. _update_to_selected() -> DownloadWorker.run()).
+        # Остаётся тем же вызовом — вся ветвящаяся логика уже переехала в
+        # _update_to_selected()/_version_key_for(), здесь больше нечего
+        # различать.
+        self._update_to_selected()
 
     # ── Worker management ─────────────────────────────────────────────────────
 

@@ -173,10 +173,34 @@ class PanelDepotClient:
         except Exception:
             return None
 
-    # ── depot_manifest.json ──────────────────────────────────────────────
+    # ── depot_manifest.json / версии для отката (2026-09-29) ─────────────
 
-    def fetch_manifest(self) -> Optional[dict]:
+    def fetch_manifest(self, version_key: Optional[str] = None) -> Optional[dict]:
+        """Без `version_key` — текущий (последний опубликованный)
+        манифест. С `version_key` — исторический снапшот
+        `versions/<key>.json` (см. TESL-Panel::builds_db.py::
+        record_version(), пишется панелью автоматически на каждой
+        публикации, не нужен отдельный вызов на стороне менеджера).
+        Формат JSON у обоих путей идентичен (`DepotManifest.to_dict()`) —
+        снапшот версии — буквальная копия того, что было в
+        depot_manifest.json на момент ТОЙ публикации. `download_chunk()`
+        работает одинаково для любой версии — паки/чанки cumulative
+        между публикациями (см. TESL-Manager/CLAUDE.md "Критический
+        баг..."), исторический манифест просто ссылается на чанки,
+        которые уже физически лежат на сервере."""
+        if version_key:
+            return self.get_json(f"versions/{version_key}.json", timeout=30)
         return self.get_json("depot_manifest.json", timeout=30)
+
+    def list_versions(self) -> List[dict]:
+        """[{"version_key","build_number","description","file_count",
+        "total_size","created_at"}, ...], самая новая первой — пусто (не
+        None) на любую ошибку/если публикаций ещё не было, вызывающему
+        (UI отката) не нужно различать эти два случая."""
+        data = self.get_json("versions", timeout=15)
+        if data is None:
+            return []
+        return data.get("versions", [])
 
     # ── extras_manifest.json (documents/patch/patchs) ────────────────────
 

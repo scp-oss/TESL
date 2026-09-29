@@ -22,23 +22,34 @@ from core.panel_client import PanelDepotClient
 # ── Манифест сборки с панели — общее для DownloadWorker и VerifyWorker ────────
 # **2026-09-28: заменяет _get_version_manifest_rel_path()/_load_chunk_manifest()
 # (WebDAV .db-компаньон)** — переход на TESL-Panel, см. CLAUDE.md "Переход на
-# TESL-Panel". Панель отдаёт РОВНО ОДНО текущее состояние на build_id
-# (`depot_manifest.json`, не набор версий с историей, как старый WebDAV
-# depot.json) — поэтому "версия" в новом протоколе значит "то, что сейчас
-# реально опубликовано для этой сборки", выбор версии из списка (были у
-# WebDAV combo_versions) больше не имеет смысла как отдельная фича; см.
-# VersionLoaderWorker ниже — синтезирует единственную псевдо-"версию"
-# ("build #N") ради обратной совместимости с существующим UI main_window.py
-# (комбобокс/кнопки install/update там не переписывались в этом заходе).
+# TESL-Panel".
+#
+# **2026-09-29: панель теперь ДЕЙСТВИТЕЛЬНО хранит историю версий**
+# (см. TESL-Panel::builds_db.py::record_version()/list_build_versions() —
+# снапшот на каждую публикацию, последние `TESL_PANEL_KEEP_VERSIONS`)
+# — комментарий ниже до этой правки говорил обратное ("панель отдаёт
+# РОВНО ОДНО текущее состояние"), это было верно ДО этой даты, больше не
+# актуально. `VersionLoaderWorker` теперь получает РЕАЛЬНЫЙ список версий
+# вместо синтетической единственной псевдо-версии — старая UI-машинерия
+# main_window.py (combo_versions/btn_rollback/_rollback_to_selected(),
+# которая ждала этого с самого перехода на панель) заработала по
+# назначению без переписывания самой этой машинерии.
 
-def _load_panel_manifest(client: PanelDepotClient):
+def _load_panel_manifest(client: PanelDepotClient, version_key: Optional[str] = None):
     """Возвращает (entries, meta) — entries в ТОЧНО той же форме
     (List[FileEntry] из core.chunk_manifest_db), которую уже ожидает
     ChunkInstaller (её интерфейс не менялся вообще, см. её собственный
     докстринг класса) — сам ChunkInstaller не знает и не должен знать,
-    что источник теперь панель, а не WebDAV .db-компаньон. None, если
-    сборка не найдена / манифест недоступен (сеть, ещё не публиковалась)."""
-    raw = client.fetch_manifest()
+    что источник теперь панель, а не WebDAV .db-компаньон, и не знает
+    про версии вообще — ему всё равно, какой набор entries установить.
+    None, если сборка не найдена / манифест недоступен (сеть, ещё не
+    публиковалась, или `version_key` не существует — например, был
+    удалён pruning'ом старше `TESL_PANEL_KEEP_VERSIONS`).
+
+    `version_key=None` — текущая (последняя опубликованная) версия,
+    как и раньше. С `version_key` — конкретная историческая версия (см.
+    `PanelDepotClient.fetch_manifest()`), путь отката."""
+    raw = client.fetch_manifest(version_key)
     if raw is None:
         return None
     entries = []
@@ -97,27 +108,36 @@ class ThreadSafeWorker(QObject):
 # ── Version loader ────────────────────────────────────────────────────────────
 
 class VersionLoaderWorker(ThreadSafeWorker):
-    """Загружает сведения о текущей сборке с TESL-Panel.
+    """Загружает сведения о сборке с TESL-Panel, включая РЕАЛЬНУЮ историю
+    версий (2026-09-29, см. TESL-Panel::builds_db.py::record_version()).
 
-    **2026-09-28**: панель отдаёт РОВНО ОДНО текущее состояние на
-    build_id (`depot_manifest.json`) — нет истории версий/каналов, как
-    у старого WebDAV `depot.json` (`versions{}`+`current{}`). Вместо
-    того чтобы выбрасывать весь UI выбора версии из main_window.py
-    (большой, рискованный рефакторинг вне объёма этого захода — сам
-    выбор СБОРКИ уже переехал на уровень выше, в карусель), эмитит
-    список из ОДНОЙ синтетической "версии" (`"build #N"`, из
-    `depot_manifest.json`'s `build_number`) — тот же сигнальный
-    контракт (`versions_loaded: list[str]`, `current_version: str`),
-    что и раньше, комбобокс в main_window.py работает без изменений,
-    просто всегда с одним пунктом. `description` (текст релиза, см.
-    CLAUDE.md "Описание релиза") эмитится отдельным сигналом —
-    единственное реально НОВОЕ, что появилось здесь."""
+    **До 2026-09-29** панель отдавала РОВНО ОДНО текущее состояние на
+    build_id — этот воркер синтезировал единственную псевдо-"версию"
+    ("build #N") ради обратной совместимости с уже существующим UI
+    выбора версии в main_window.py (combo_versions/btn_rollback —
+    построен изначально под старый WebDAV `depot.json` с реальной
+    историей, просто не имел, что показывать после перехода на панель).
+    Теперь панель версионирует каждую публикацию сама — этот воркер
+    просто передаёт то, что она отдаёт, без искусственного ограничения
+    до одного пункта; сама UI-машинерия main_window.py не менялась,
+    ей и раньше нужен был именно такой список.
 
-    log             = pyqtSignal(str)
-    versions_loaded = pyqtSignal(list)    # [label, ...] — сейчас всегда 0 или 1 элемент
-    current_version = pyqtSignal(str)     # label текущей (единственной) версии
-    description     = pyqtSignal(str)     # текст описания релиза (может быть пустым)
-    finished        = pyqtSignal(bool)
+    `version_meta_loaded` — новый сигнал (`{label: {"version_key",
+    "description","build_number","created_at",...}}`), нужен ИМЕННО
+    чтобы combo_versions мог отличаться отображаемым текстом
+    (человекочитаемая метка) от реального ключа, который нужно
+    передать `PanelDepotClient.fetch_manifest(version_key=...)` для
+    установки/отката НЕ-последней версии, и чтобы выбор в combo мог
+    показать описание ИМЕННО той версии, не только текущей — см.
+    main_window.py::`_on_version_meta_loaded()`/`_on_version_selected()`/
+    `DownloadWorker.run()`."""
+
+    log                  = pyqtSignal(str)
+    versions_loaded      = pyqtSignal(list)   # [label, ...], самая новая первой
+    version_meta_loaded  = pyqtSignal(dict)   # {label: {version_key,description,build_number,created_at,...}} — пусто для сборок без истории (публиковались до 2026-09-29)
+    current_version      = pyqtSignal(str)    # label самой новой версии
+    description          = pyqtSignal(str)    # текст описания релиза текущей версии (может быть пустым)
+    finished             = pyqtSignal(bool)
 
     def __init__(self, channel: str = "stable"):
         super().__init__()
@@ -131,31 +151,68 @@ class VersionLoaderWorker(ThreadSafeWorker):
             if not build_id:
                 self.log.emit("❌ Сборка не выбрана")
                 self.versions_loaded.emit([])
+                self.version_meta_loaded.emit({})
                 self.finished.emit(False)
                 return
 
             self.log.emit("Загружаем сведения о сборке...")
             client = PanelDepotClient(build_id)
             try:
+                versions = client.list_versions()
+                # Текущий манифест всё равно нужен: (а) как единственный
+                # источник description/build_number для сборок без
+                # истории (публиковались до 2026-09-29 — их прошлые
+                # версии просто никогда не были засняты), (б) как
+                # запасной путь, если сама выборка версий не удалась,
+                # но текущая публикация читается нормально.
                 raw = client.fetch_manifest()
             finally:
                 client.close()
 
-            if not raw:
+            if not raw and not versions:
                 self.log.emit("Не удалось получить манифест сборки (ещё не публиковалась?)")
                 self.versions_loaded.emit([])
+                self.version_meta_loaded.emit({})
                 self.finished.emit(False)
                 return
 
-            label = f"build #{raw.get('build_number', '?')}"
-            self.versions_loaded.emit([label])
-            self.current_version.emit(label)
-            self.description.emit(raw.get("description", "") or "")
-            self.log.emit(f"Текущая версия: {label}")
+            if versions:
+                labels = []
+                meta_map = {}
+                for v in versions:
+                    created = (v.get("created_at") or "")[:19].replace("T", " ")
+                    label = f"build #{v.get('build_number', '?')} — {created}" if created else f"build #{v.get('build_number', '?')}"
+                    # Коллизия крайне маловероятна (build_number растёт
+                    # монотонно, см. depot_sync_manager.py), но на всякий
+                    # случай не молчим — иначе combo_versions потеряет пункт.
+                    if label in meta_map:
+                        label = f"{label} ({v['version_key']})"
+                    labels.append(label)
+                    meta_map[label] = v
+                current_label = labels[0]
+                description = raw.get("description", "") if raw else (versions[0].get("description") or "")
+            else:
+                # Сборка публиковалась ДО того, как панель начала
+                # версионировать (2026-09-29) — истории для неё нет,
+                # показываем ровно то единственное, что показывали до
+                # этой правки. Без version_key в meta_map — DownloadWorker
+                # трактует отсутствие ключа как "текущая версия", что тут
+                # и есть единственно возможное значение.
+                current_label = f"build #{raw.get('build_number', '?')}"
+                labels = [current_label]
+                meta_map = {}
+                description = raw.get("description", "") or ""
+
+            self.versions_loaded.emit(labels)
+            self.version_meta_loaded.emit(meta_map)
+            self.current_version.emit(current_label)
+            self.description.emit(description)
+            self.log.emit(f"Текущая версия: {current_label}" + ("" if versions else " (истории версий пока нет)"))
             self.finished.emit(True)
         except Exception as e:
             self.log.emit(f"Ошибка загрузки сведений о сборке: {e}")
             self.versions_loaded.emit([])
+            self.version_meta_loaded.emit({})
             self.finished.emit(False)
 
 
@@ -165,15 +222,24 @@ class DownloadWorker(ThreadSafeWorker):
     """
     Скачивает файлы сборки с TESL-Panel (build_id = config.CURRENT_BUILD_ID,
     выбирается в карусели) через ChunkInstaller/PanelDepotClient — см.
-    CLAUDE.md "Переход на TESL-Panel". Всегда устанавливает ТЕКУЩЕЕ
-    опубликованное состояние сборки — панель не хранит историю версий,
-    как раньше хранил WebDAV depot.json.
+    CLAUDE.md "Переход на TESL-Panel".
+
+    **2026-09-29**: `version_key` в task dict — если задан, устанавливает
+    ИМЕННО эту историческую версию (откат), не обязательно последнюю
+    опубликованную. `None`/отсутствует — как и раньше, текущая
+    (последняя) версия. main_window.py резолвит `version_label`
+    (человекочитаемый текст combo_versions) → `version_key` через карту,
+    полученную от `VersionLoaderWorker.version_keys_loaded` (см. её
+    докстринг) — ПЕРЕД созданием task dict, сам DownloadWorker не знает
+    ничего про метки, только про реальный ключ.
 
     task dict:
       type: "install" | "verify_and_install" | "apply_version"
       local_dir: str
-      version_label: str | None  (принимается для совместимости с
-        main_window.py, больше ни на что не влияет — см. run())
+      version_label: str | None  (только для отображения/возобновления
+        паузы — см. main_window.py::_resume_paused_install())
+      version_key: str | None  (реальный ключ версии для установки —
+        None значит "текущая", см. выше)
     """
 
     log                    = pyqtSignal(str)
@@ -201,11 +267,7 @@ class DownloadWorker(ThreadSafeWorker):
     def run(self):
         try:
             local_dir = Path(self.task.get("local_dir", ""))
-            # version_label — оставлен в task dict вызывающим кодом
-            # (main_window.py не переписывался в этом заходе) но больше
-            # ничего не значит: у панели нет истории версий, всегда
-            # устанавливается ТЕКУЩЕЕ опубликованное состояние сборки
-            # (CURRENT_BUILD_ID, выбранной в карусели). См. класс-докстринг.
+            version_key = self.task.get("version_key") or None
 
             if not local_dir:
                 self.log.emit("❌ Локальная папка не задана")
@@ -221,9 +283,12 @@ class DownloadWorker(ThreadSafeWorker):
 
             self._client = PanelDepotClient(build_id)
 
-            loaded = _load_panel_manifest(self._client)
+            loaded = _load_panel_manifest(self._client, version_key)
             if loaded is None:
-                self.log.emit("❌ Не удалось получить манифест сборки")
+                if version_key:
+                    self.log.emit(f"❌ Не удалось получить манифест версии {version_key} (устарела и вычищена? см. TESL_PANEL_KEEP_VERSIONS)")
+                else:
+                    self.log.emit("❌ Не удалось получить манифест сборки")
                 self.finished.emit(False)
                 return
             entries, meta = loaded
@@ -232,7 +297,10 @@ class DownloadWorker(ThreadSafeWorker):
                 self.finished.emit(True)
                 return
 
-            self.log.emit(f"📋 Build #{meta.get('build_number', '?')}, файлов: {len(entries)}")
+            if version_key:
+                self.log.emit(f"⏪ Откат на версию {version_key}: build #{meta.get('build_number', '?')}, файлов: {len(entries)}")
+            else:
+                self.log.emit(f"📋 Build #{meta.get('build_number', '?')}, файлов: {len(entries)}")
 
             installer = ChunkInstaller(
                 client=self._client,
