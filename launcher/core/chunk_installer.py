@@ -54,6 +54,51 @@ def _fmt_eta(seconds: float) -> str:
     return f"{s}с"
 
 
+def _reorder_for_disk_locality(chunk_order: List[str], client, max_workers: int) -> List[str]:
+    """Живой инцидент 2026-09-30: 134GB сборка (TESVAE) стабильно "виснет"
+    на скачивании (скорость сползает к нулю), тогда как тестовая 2GB
+    сборка (WALLPEPA) через ту же панель тем же клиентом качается быстро.
+    Диагностика на сервере: `iostat` во время затыка — диск под депо
+    (sda, HDD) насыщен (`%util≈100`, `aqu-sz≈27`, `r_await≈98мс`);
+    `filefrag` на pack-файлах TESVAE и WALLPEPA показал по 2 экстента у
+    обоих — файлы физически НЕ фрагментированы. Значит дело не в
+    состоянии диска, а в том, в каком порядке клиент запрашивает байты
+    ВНУТРИ этих физически цельных pack-файлов: `chunk_order` в install()
+    ниже намеренно построен ПО ФАЙЛАМ (см. его собственный комментарий,
+    фикс 2026-09-23 от OOM) — этот порядок никак не связан с физическим
+    расположением чанков на сервере, так что 24 параллельных Range-GET
+    в любой момент времени бьют по случайным офсетам во всём 134GB
+    датасете. Для WALLPEPA (2GB) это незаметно — умещается в page cache
+    сервера (31GB RAM) целиком после первого касания; 134GB заведомо не
+    умещаются, каждое "логически случайное" чтение — реальный seek HDD.
+
+    НЕ трогает макро-порядок chunk_order (защита от OOM по-прежнему
+    работает как раньше — файлы с меньшим числом чанков всё так же идут
+    первыми, у файла всё так же есть шанс быстро собраться и освободить
+    кэш) — только локально пересортировывает каждое окно из
+    ~4×max_workers подряд идущих элементов по (pack, offset), если
+    клиент умеет отдавать физическое расположение чанка
+    (`get_chunk_location()` — есть только у `PanelDepotClient`/packed-
+    протокола; легаси WebDAV `DepotClient` и любой тестовый дублёр без
+    этого метода получают chunk_order БЕЗ ИЗМЕНЕНИЙ, через простой
+    `getattr`-детект — нулевой риск для уже проверенных путей). Внутри
+    окна такого размера потолок памяти/тайминг завершения файлов
+    возмущается лишь локально, не возвращает старую опасность (чанки
+    файла разбросаны по ВСЕМУ диапазону из сотен тысяч, живой инцидент
+    2026-09-22/23) — окно на порядки меньше типичного needed_chunks."""
+    get_loc = getattr(client, "get_chunk_location", None)
+    if get_loc is None:
+        return chunk_order
+    window = max(64, max_workers * 4)
+    result: List[str] = []
+    for start in range(0, len(chunk_order), window):
+        batch = chunk_order[start:start + window]
+        locs = {cid: get_loc(cid) for cid in batch}
+        batch.sort(key=lambda cid: (locs[cid] is None, locs[cid] or ("", 0)))
+        result.extend(batch)
+    return result
+
+
 class ChunkInstaller:
     """
     `client` — любой объект с методом `download_chunk(chunk_id: str) ->
@@ -444,6 +489,13 @@ class ChunkInstaller:
                     if cid not in seen_cids:
                         seen_cids.add(cid)
                         chunk_order.append(cid)
+
+            # Локальная пересортировка по физическому расположению на
+            # сервере (pack, offset) — см. _reorder_for_disk_locality()
+            # за живой повод (2026-09-30). Не меняет макро-порядок/защиту
+            # от OOM выше, только порядок внутри скользящих окон; у
+            # клиентов без get_chunk_location() (легаси WebDAV) — no-op.
+            chunk_order = _reorder_for_disk_locality(chunk_order, self.client, self.max_workers)
 
             # НЕ submit'им всё сразу — раньше здесь было
             # `{pool.submit(_dl, cid): cid for cid in sorted(needed_chunks)}`

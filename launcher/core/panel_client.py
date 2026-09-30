@@ -321,6 +321,26 @@ class PanelDepotClient:
             return None
         return data
 
+    def get_chunk_location(self, chunk_id: str) -> Optional[Tuple[str, int]]:
+        """Физическое расположение чанка — (pack, offset), без size.
+        Используется ChunkInstaller'ом (см. его
+        `_reorder_for_disk_locality()`, живой повод — 2026-09-30, диск
+        сервера насыщался под логически случайным порядком чтения
+        физически цельных pack-файлов) ТОЛЬКО для локальной
+        пересортировки очереди закачки ради дисковой локальности на
+        сервере — не меняет, ЧТО скачивается, только относительный
+        порядок внутри окна. Возвращает None, если чанка нет в индексе
+        (легаси-сборка без упаковки — ChunkInstaller в этом случае
+        получает пустой словарь от _ensure_chunk_index() и просто не
+        находит локацию, что эквивалентно отсутствию этого метода у
+        клиента вообще с точки зрения результата сортировки)."""
+        index = self._ensure_chunk_index()
+        loc = index.get(chunk_id)
+        if loc is None:
+            return None
+        pack, offset, _size = loc
+        return (pack, offset)
+
     def chunk_error_summary(self) -> str:
         """Одна строка вида 'timeout: 1800, http_404: 220' для итогового
         лога — см. core/workers.py::DownloadWorker.run(). Пусто, если
