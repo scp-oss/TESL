@@ -391,11 +391,62 @@ class UpdaterUI(QWidget):
 
     # ── Config ────────────────────────────────────────────────────────────────
 
+    def _build_key(self) -> str:
+        """Стабильный ключ ТЕКУЩЕЙ сборки для всего per-build состояния в
+        config.json/progress.json (local_dirs/installed_versions/
+        paused_install.build_id) — прямой запрос пользователя 2026-09-30:
+        "сейчас сборки я переключаю а путь один" — до этой правки
+        local_dir/installed_version хранились ОДНИМ общим полем в
+        config.json (единственном на весь APPDATA_DIR, не под
+        BUILD_DATA_DIR), так что переключение сборки в карусели не помнило
+        разные папки установки для разных сборок. `CURRENT_BUILD_ID` —
+        реальный build_id с панели, если карусель его дала; `BUILD_NAME` —
+        фолбэк на случай, если панель недоступна и сборка пришла из
+        зашитого дефолта (см. core/builds.py::list_builds() — тогда
+        build_id пустой). Читаем `config` ЖИВЬЁМ через локальный import
+        (не `from config import CURRENT_BUILD_ID` на верху файла) — та же
+        дисциплина, что и везде в этом движке для значений, которые
+        activate_build() меняет уже ПОСЛЕ импорта модуля (см. CLAUDE.md
+        "config.py::activate_build(build)")."""
+        import config as _config
+        return _config.CURRENT_BUILD_ID or _config.BUILD_NAME
+
     def _load_config(self):
         try:
             if CONFIG_FILE.exists():
                 self.config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                folder = self.config.get("local_dir", "")
+                key = self._build_key()
+                local_dirs = self.config.setdefault("local_dirs", {})
+                folder = local_dirs.get(key, "")
+                if not folder:
+                    # Миграция со старого общего поля (до этой правки был
+                    # один "local_dir" на все сборки сразу) — если для
+                    # ЭТОЙ сборки ещё ничего не записано, но старое плоское
+                    # поле есть, считаем его принадлежащим текущей сборке
+                    # (исторически сборка была всегда одна — TESVAE).
+                    # Пишем сразу в local_dirs, чтобы миграция была
+                    # одноразовой, а не повторялась на каждом старте.
+                    legacy_folder = self.config.pop("local_dir", "")
+                    # .pop(), не .get() — легаси-ключ должен исчезнуть
+                    # СРАЗУ после первого чтения. Живой баг, пойманный
+                    # синтетическим тестом ДО деплоя: с .get() старое поле
+                    # оставалось в config навсегда, и при переключении на
+                    # ДРУГУЮ сборку (новый key, ещё без своей записи в
+                    # local_dirs) миграция срабатывала ПОВТОРНО и отдавала
+                    # ей путь ПЕРВОЙ сборки — то есть после "миграции" все
+                    # сборки без явно выбранной своей папки схлопывались
+                    # обратно в один и тот же путь, ровно то, что эта
+                    # правка должна была устранить.
+                    if legacy_folder:
+                        folder = legacy_folder
+                        local_dirs[key] = legacy_folder
+                        # Сохраняем СРАЗУ — иначе .pop() выше живёт только
+                        # в памяти этого процесса; если следующий запуск
+                        # лаунчера выберет ДРУГУЮ сборку до того, как
+                        # что-нибудь ещё вызовет _save_config(), он увидит
+                        # на диске всё тот же старый "local_dir" и повторит
+                        # ту же неверную миграцию для себя.
+                        self._save_config()
                 if folder and Path(folder).exists():
                     self._full_local_path = folder
                     self._update_folder_label()
@@ -417,6 +468,16 @@ class UpdaterUI(QWidget):
         # "resume" — сверяет local_dir с уже загруженным
         # self._full_local_path (см. блок чуть выше в этой же функции).
         self._paused_install = self.progress_data.get("paused_install")
+        if self._paused_install:
+            # build_id в записи — принадлежит ли эта пауза ИМЕННО текущей
+            # сборке, не другой (progress.json тоже один на все сборки).
+            # Отсутствие поля — запись ещё со старой, до этой правки,
+            # версии лаунчера (тогда сборка была всегда одна) — считаем
+            # её "моей", та же миграционная логика, что и у local_dirs
+            # выше.
+            paused_key = self._paused_install.get("build_id")
+            if paused_key is not None and paused_key != self._build_key():
+                self._paused_install = None
         if self._paused_install:
             self._append_log(
                 f"⏸ Обнаружена приостановленная установка "
@@ -464,7 +525,7 @@ class UpdaterUI(QWidget):
         if not folder:
             return
         self._full_local_path = folder
-        self.config["local_dir"] = folder
+        self.config.setdefault("local_dirs", {})[self._build_key()] = folder
         self._save_config()
         self._update_folder_label()
         self._append_log(f"Выбрана папка: {folder}")
@@ -631,7 +692,8 @@ class UpdaterUI(QWidget):
             version = None
 
         # Запоминаем, какую версию реально ставим — на завершении worker'а
-        # запишем её в config["installed_version"] (см. _on_worker_finished).
+        # запишем её в config["installed_versions"][build_key] (см.
+        # _on_worker_finished()/_build_key()).
         # version=None значит "текущая/последняя" — разрешаем в конкретную
         # метку по своему приоритету, раз сервер сам её не всегда знает
         # (у этой сборки "current" в depot.json пуст — см. CLAUDE.md).
@@ -816,7 +878,23 @@ class UpdaterUI(QWidget):
             self._set_status_button("install")
             return
 
-        installed = self.config.get("installed_version", "")
+        # installed_versions — per-build (см. _build_key()); миграция со
+        # старого общего "installed_version" на первое чтение для текущей
+        # сборки, тот же принцип, что и у local_dirs в _load_config().
+        installed_versions = self.config.setdefault("installed_versions", {})
+        key = self._build_key()
+        installed = installed_versions.get(key, "")
+        if not installed:
+            # .pop(), не .get() — та же причина, что у local_dir в
+            # _load_config(): легаси-ключ должен исчезнуть СРАЗУ, иначе
+            # при переключении на ДРУГУЮ сборку (свежий процесс, ещё нет
+            # своей записи в installed_versions) миграция сработает
+            # повторно и отдаст ей версию ПЕРВОЙ сборки.
+            legacy_installed = self.config.pop("installed_version", "")
+            if legacy_installed:
+                installed = legacy_installed
+                installed_versions[key] = legacy_installed
+                self._save_config()
         target = self.combo_versions.currentText()
         if target in ("Загрузка...", "Нет доступных версий", ""):
             target = self._current_version
@@ -996,7 +1074,7 @@ class UpdaterUI(QWidget):
         self._clear_paused_install()
 
         if ok and self._pending_install_target:
-            self.config["installed_version"] = self._pending_install_target
+            self.config.setdefault("installed_versions", {})[self._build_key()] = self._pending_install_target
             self._save_config()
         self._pending_install_target = None
         self._refresh_status_button()
@@ -1093,6 +1171,12 @@ class UpdaterUI(QWidget):
                 self.progress_data["paused_install"] = {
                     "local_dir": self._current_task.get("local_dir", self._full_local_path),
                     "version_label": self._current_task.get("version_label") or self._pending_install_target,
+                    # build_id — чтобы _load_config() после перезапуска
+                    # знал, к КАКОЙ сборке относится эта пауза (progress.json
+                    # тоже один на все сборки, см. _build_key()) — иначе
+                    # "Продолжить" могло бы всплыть у другой сборки, если у
+                    # неё случайно совпал бы local_dir.
+                    "build_id": self._build_key(),
                 }
                 self._paused_install = self.progress_data["paused_install"]
                 self._save_progress()
