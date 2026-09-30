@@ -302,6 +302,9 @@ class DownloadWorker(ThreadSafeWorker):
             else:
                 self.log.emit(f"📋 Build #{meta.get('build_number', '?')}, файлов: {len(entries)}")
 
+            debug_mode = bool(self.task.get("debug_mode", False))
+            if debug_mode:
+                self.log.emit("🐛 Режим отладки включён — пишу построчную трассировку установки")
             installer = ChunkInstaller(
                 client=self._client,
                 local_dir=local_dir,
@@ -312,6 +315,7 @@ class DownloadWorker(ThreadSafeWorker):
                 on_current=self.current_file.emit,
                 should_stop=self._should_stop,
                 wait_if_paused=self._wait_if_paused,
+                debug=debug_mode,
             )
             ok = installer.install(entries)
             # Сводка ПРИЧИН отказа скачивания чанков (не одна строка на
