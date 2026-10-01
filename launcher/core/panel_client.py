@@ -143,7 +143,17 @@ class PanelDepotClient:
 
     def __init__(self, build_id: str, base_url: str = None):
         self.build_id = build_id
-        self.base = (base_url or _config.PANEL_BASE_URL).rstrip("/")
+        # 2026-10-01: по умолчанию — bypass-домен (PANEL_DOWNLOAD_BASE_URL,
+        # см. config.py), не обычный PANEL_BASE_URL за Cloudflare Proxied.
+        # Прямой запрос пользователя после диагностики "смешной скорости"
+        # (0.2 МБ/с) — тот же вывод, что уже применён на стороне
+        # TESL-Manager для заливки (см. её CLAUDE.md "Cloudflare Proxied
+        # душит крупные аплоады"), теперь и для скачивания: тысячи мелких
+        # Range-GET на чанки — именно тот паттерн запросов, который CF
+        # Proxied, по опыту этого проекта, режет сильнее всего. Явный
+        # base_url (например, список версий/manifest через обычный домен,
+        # если это когда-нибудь понадобится отдельно) всё ещё побеждает.
+        self.base = (base_url or _config.PANEL_DOWNLOAD_BASE_URL).rstrip("/")
         self.session = _session()
         self.chunk_errors: "Counter[str]" = Counter()
         self._chunk_index: Optional[Dict[str, Tuple[str, int, int]]] = None

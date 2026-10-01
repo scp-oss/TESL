@@ -243,10 +243,51 @@ class ChunkInstaller:
         # выключено по умолчанию — на 155К+ чанках это реально много
         # строк, включать только когда целенаправленно ищем дыру.
         self.debug = debug
+        # Буфер debug-трассы — см. _dbg_emit() за живой повод (2026-09-30).
+        self._dbg_lock = threading.Lock()
+        self._dbg_buffer: List[str] = []
+        self._dbg_last_flush = time.monotonic()
 
     def _dbg(self, msg: str) -> None:
         if self.debug:
-            self.on_log(msg)
+            self._dbg_emit(msg)
+
+    def _dbg_emit(self, msg: Optional[str], force: bool = False) -> None:
+        """Живой инцидент 2026-09-30: на реальной установке (10772 файлов,
+        16647 уникальных чанков) построчная debug-трасса — отдельный
+        self.on_log() на КАЖДЫЙ `plan`/`dl`/`assemble`/`cache.put`/
+        `cache.release` — производила десятки тысяч вызовов за секунды
+        (один только цикл `plan` ниже отрабатывает 16647 раз подряд ДО
+        старта самой закачки, синхронно, в одном потоке). `on_log` в
+        реальном приложении (core/workers.py -> `self.log.emit`) доезжает
+        до `ui/main_window.py::_append_log()` через auto-queued
+        cross-thread соединение — КАЖДЫЙ вызов это отдельное событие в
+        очереди GUI-потока плюс синхронная запись в LOG_FILE (открыть/
+        записать/закрыть). GUI-поток захлёбывался этим потоком быстрее,
+        чем успевал разгребать — выглядело как полное зависание всего
+        приложения ("53.6 МБ и всё зависло" — прогресс-бар тоже идёт
+        через тот же GUI-поток и той же живой лог показывал отставание),
+        хотя фоновая загрузка, возможно, продолжала идти.
+
+        Буферизуем и сбрасываем ОДНИМ вызовом on_log() не чаще раза в
+        0.3с (или раз в 500 накопленных строк) — join'ом, ни одна строка
+        не теряется, только группируются в пачки: весь смысл debug-режима
+        именно в полноте трассы. Тот же класс фикса, что уже применялся
+        для speed_update (см. CLAUDE.md «Дублирование строк скорости в
+        логе»), здесь — впервые доведённый до самого debug-режима,
+        которого раньше просто не существовало на момент того фикса."""
+        with self._dbg_lock:
+            if msg is not None:
+                self._dbg_buffer.append(msg)
+            if not self._dbg_buffer:
+                return
+            now = time.monotonic()
+            if not force and (now - self._dbg_last_flush) < 0.3 and len(self._dbg_buffer) < 500:
+                return
+            batch = self._dbg_buffer
+            self._dbg_buffer = []
+            self._dbg_last_flush = now
+        self.on_log("\n".join(batch))
 
     def diff(self, entries: List[FileEntry]) -> List[FileEntry]:
         """Сравнивает entries с локальными файлами (существование/размер/
@@ -347,7 +388,7 @@ class ChunkInstaller:
             for cid in unique_ids:
                 chunk_to_files.setdefault(cid, []).append(i)
 
-        cache = _ChunkCache(self.cache_bytes_limit, debug_log=self.on_log if self.debug else None)
+        cache = _ChunkCache(self.cache_bytes_limit, debug_log=self._dbg_emit if self.debug else None)
         for cid, files in chunk_to_files.items():
             cache.plan(cid, len(files))
             self._dbg(f"🐛 plan {cid[:12]} needed_by={len(files)} files={files}")
@@ -472,6 +513,8 @@ class ChunkInstaller:
                 if self.should_stop():
                     for f in in_flight:
                         f.cancel()
+                    if self.debug:
+                        self._dbg_emit(None, force=True)
                     self.on_log("⏹ Загрузка остановлена")
                     return False
 
@@ -531,9 +574,26 @@ class ChunkInstaller:
                         last_sample_written = written_bytes
                     bytes_remaining = total_bytes - downloaded_bytes
                     eta = _fmt_eta(bytes_remaining / smoothed_dl_speed) if smoothed_dl_speed > 0 else "?"
+                    # Живая сводка причин отказов — ЖИВЬЁМ в статус-строке,
+                    # не только в конце install() (как chunk_error_summary()
+                    # в DownloadWorker.run()). Повод 2026-10-01: пользователь
+                    # пожаловался на "смешную скорость" (0.2 МБ/с) на реальной
+                    # установке, не на зависание — без видимости причины
+                    # вслепую непонятно, это узкий канал сам по себе или
+                    # retry-штраф (urllib3 Retry: backoff 1/2/4с на каждый
+                    # timeout/5xx) умножает и без того узкий канал. getattr —
+                    # не все клиенты (тестовые дублёры) обязаны иметь этот
+                    # метод, ChunkInstaller по контракту работает с любым
+                    # объектом, у которого есть download_chunk().
+                    error_info = ""
+                    get_summary = getattr(self.client, "chunk_error_summary", None)
+                    if get_summary:
+                        s = get_summary()
+                        if s:
+                            error_info = f" — ошибки: {s}"
                     self.on_current(
                         f"{pct}% — ⬇ {smoothed_dl_speed / 1024 / 1024:.1f} MB/s / "
-                        f"💾 {smoothed_wr_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
+                        f"💾 {smoothed_wr_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}{error_info}"
                     )
 
                 for i in ready:
@@ -541,6 +601,8 @@ class ChunkInstaller:
                 _submit_more()
         # Оба `with`-пула закрылись здесь — assemble_pool.__exit__ дожидается
         # ВСЕХ поставленных _assemble(), сборка файлов тоже уже завершена.
+        if self.debug:
+            self._dbg_emit(None, force=True)
 
         if failed_chunk_ids:
             self.on_log(f"❌ Не удалось скачать {len(failed_chunk_ids)} чанков — часть файлов пропущена")
