@@ -331,6 +331,79 @@ class PanelDepotClient:
             return None
         return data
 
+    def get_chunk_location_full(self, chunk_id: str) -> Optional[Tuple[str, int, int]]:
+        """(pack, offset, size) — как get_chunk_location(), но с размером,
+        нужным для склейки физически смежных чанков в один Range-запрос
+        (см. chunk_installer.py::_group_for_batch()). Отдельный метод, а
+        не расширение существующего get_chunk_location() — тот уже
+        используется `_reorder_for_disk_locality()`, трогать его
+        сигнатуру без необходимости рискованно."""
+        return self._ensure_chunk_index().get(chunk_id)
+
+    def download_chunks_batched(self, chunk_ids: List[str]) -> Dict[str, Optional[bytes]]:
+        """Один Range-GET на несколько физически смежных чанков вместо
+        одного запроса на чанк — живой повод 2026-10-02: пользователь
+        написал и прогнал `batch_bench.py` (собственный замер, не наша
+        гипотеза) против реального `tesl-panel.neth.de5.net` и bypass-
+        домена `transport.neth.de5.net` — батч по 8МБ дал ~1.2x к
+        скорости и втрое меньше запросов на ОБОИХ доменах (CF-proxied:
+        21.56 -> 26.31 МБ/с; bypass: 84.17 -> 103.55 МБ/с), поверх уже
+        переключённого bypass-домена (см. config.py::
+        PANEL_DOWNLOAD_BASE_URL) — независимый, аддитивный выигрыш, не
+        альтернатива ему.
+
+        Группировку (какие chunk_id физически смежны и укладываются в
+        лимит батча) делает ВЫЗЫВАЮЩИЙ код
+        (`chunk_installer.py::_group_for_batch()`) — здесь только
+        транспорт: один GET на объединённый диапазон, срез по каждому
+        чанку, верификация КАЖДОГО по sha256 отдельно. Возвращает
+        `{chunk_id: bytes|None}` — `None` для конкретного chunk_id
+        означает именно его отказ (например, битый sha256 внутри иначе
+        успешной пачки), остальные чанки той же пачки при этом остаются
+        валидными. Полный сетевой отказ (таймаут/обрыв/HTTP-ошибка)
+        помечает ВСЕ чанки пачки одной и той же причиной в
+        `chunk_errors` — для пачки из одного элемента это даёт тот же
+        результат, что и `download_chunk()`."""
+        if not chunk_ids:
+            return {}
+        if len(chunk_ids) == 1:
+            return {chunk_ids[0]: self.download_chunk(chunk_ids[0])}
+        index = self._ensure_chunk_index()
+        locs = [index.get(cid) for cid in chunk_ids]
+        if any(loc is None for loc in locs):
+            # Не должно происходить — _group_for_batch() уже фильтрует
+            # только чанки с известной локацией. Защитный откат на
+            # одиночные закачки вместо того чтобы ронять всю пачку.
+            return {cid: self.download_chunk(cid) for cid in chunk_ids}
+        pack = locs[0][0]
+        start = min(off for _, off, _ in locs)
+        end = max(off + size for _, off, size in locs)
+        try:
+            headers = {"Range": f"bytes={start}-{end - 1}"}
+            r = self.session.get(self._url(f"packs/{pack}"), headers=headers, timeout=120)
+            if r.status_code not in (200, 206):
+                self.chunk_errors[f"http_{r.status_code}"] += len(chunk_ids)
+                return {cid: None for cid in chunk_ids}
+            data = r.content
+        except requests.exceptions.Timeout:
+            self.chunk_errors["timeout"] += len(chunk_ids)
+            return {cid: None for cid in chunk_ids}
+        except requests.exceptions.ConnectionError:
+            self.chunk_errors["connection_error"] += len(chunk_ids)
+            return {cid: None for cid in chunk_ids}
+        except Exception as e:
+            self.chunk_errors[f"exception_{type(e).__name__}"] += len(chunk_ids)
+            return {cid: None for cid in chunk_ids}
+        out: Dict[str, Optional[bytes]] = {}
+        for cid, (_pack, off, size) in zip(chunk_ids, locs):
+            piece = data[off - start: off - start + size]
+            if len(piece) == size and hashlib.sha256(piece).hexdigest() == cid:
+                out[cid] = piece
+            else:
+                self.chunk_errors["sha256_mismatch"] += 1
+                out[cid] = None
+        return out
+
     def get_chunk_location(self, chunk_id: str) -> Optional[Tuple[str, int]]:
         """Физическое расположение чанка — (pack, offset), без size.
         Используется ChunkInstaller'ом (см. его

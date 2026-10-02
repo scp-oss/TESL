@@ -98,6 +98,70 @@ def _reorder_for_disk_locality(chunk_order: List[str], client, max_workers: int)
     return result
 
 
+_BATCH_BYTES = 8 * 1024 * 1024
+_BATCH_GAP_BYTES = 256 * 1024
+
+
+def _group_for_batch(chunk_order: List[str], client, batch_bytes: int, gap_bytes: int) -> List[List[str]]:
+    """Группирует УЖЕ реордеренный (`_reorder_for_disk_locality`)
+    chunk_order в задачи на закачку — список из ≥2 chunk_id, физически
+    смежных в одном pack (зазор <= gap_bytes, суммарный диапазон <=
+    batch_bytes), скачивается ОДНИМ Range-GET вместо одного на чанк.
+    Живой повод 2026-10-02: пользователь написал и прогнал собственный
+    `batch_bench.py` против реального `tesl-panel.neth.de5.net`/
+    `transport.neth.de5.net` — батч по 8МБ дал ~1.2x к скорости и втрое
+    меньше запросов на ОБОИХ доменах (CF-proxied и bypass), поверх уже
+    переключённого bypass-домена — независимый, аддитивный выигрыш.
+
+    Линейный проход по ВСЕМУ chunk_order, без повторного оконного
+    разбиения — `_reorder_for_disk_locality()` уже сгруппировал
+    физически смежные чанки внутри каждого своего окна, так что
+    последовательные элементы массива, оказавшиеся физически смежными,
+    и так уже стоят рядом; группировка просто склеивает то, что
+    оказалось рядом ПОСЛЕ той пересортировки. На границе окна
+    пересортировки физическая смежность естественно обрывается (каждое
+    окно сортируется независимо с произвольной начальной точки) —
+    отдельного ограничения по размеру окна здесь не нужно, сам факт
+    "не смежно" уже рвёт группу; batch_bytes остаётся отдельным
+    потолком на случай, если внутри окна есть длинная смежная цепочка.
+
+    Клиент без `get_chunk_location_full` (легаси WebDAV/тестовые
+    дублёры) получает ВСЕ задачи как одиночные chunk_id (тот же
+    getattr-детект, что уже использует `_reorder_for_disk_locality`) —
+    нулевой риск для уже проверенного пути: каждая "пачка" из одного
+    элемента ведёт себя идентично старому поведению по чанку."""
+    get_loc = getattr(client, "get_chunk_location_full", None)
+    if get_loc is None:
+        return [[cid] for cid in chunk_order]
+    tasks: List[List[str]] = []
+    cur_pack: Optional[str] = None
+    cur_start = cur_end = None
+    cur_group: List[str] = []
+    for cid in chunk_order:
+        loc = get_loc(cid)
+        if loc is None:
+            if cur_group:
+                tasks.append(cur_group)
+                cur_group = []
+            tasks.append([cid])
+            cur_pack = cur_start = cur_end = None
+            continue
+        pack, off, size = loc
+        if (cur_pack == pack and cur_end is not None
+                and off - cur_end <= gap_bytes
+                and max(cur_end, off + size) - cur_start <= batch_bytes):
+            cur_group.append(cid)
+            cur_end = max(cur_end, off + size)
+        else:
+            if cur_group:
+                tasks.append(cur_group)
+            cur_pack, cur_start, cur_end = pack, off, off + size
+            cur_group = [cid]
+    if cur_group:
+        tasks.append(cur_group)
+    return tasks
+
+
 def _plan_chunk_order(to_process: List[FileEntry], file_chunk_ids: List[Set[str]]) -> List[str]:
     """Порядок закачки — ПО ФАЙЛАМ (файлы с меньшим числом уникальных
     чанков первыми), не по хэшу чанка. Живой инцидент 2026-09-23: порядок
@@ -418,11 +482,14 @@ class ChunkInstaller:
         # что системный — тормозит вообще всю систему, не только установку.
         assemble_workers = min(4, max(2, os.cpu_count() or 4))
 
-        def _dl(cid: str) -> Optional[bytes]:
+        def _dl_batch(cids: List[str]) -> Dict[str, Optional[bytes]]:
             if self.should_stop():
-                return None
+                return {cid: None for cid in cids}
             self.wait_if_paused()
-            return self.client.download_chunk(cid)
+            batch_fn = getattr(self.client, "download_chunks_batched", None)
+            if batch_fn is not None:
+                return batch_fn(cids)
+            return {cid: self.client.download_chunk(cid) for cid in cids}
 
         def _assemble(i: int) -> None:
             nonlocal ok_files, fail_files, written_bytes
@@ -483,6 +550,7 @@ class ChunkInstaller:
 
             chunk_order = _plan_chunk_order(to_process, file_chunk_ids)
             chunk_order = _reorder_for_disk_locality(chunk_order, self.client, self.max_workers)
+            tasks = _group_for_batch(chunk_order, self.client, _BATCH_BYTES, _BATCH_GAP_BYTES)
 
             # Файлы БЕЗ чанков (size=0, реальные пустые файлы в манифесте)
             # никогда не станут "ready" обычным путём — remaining[i] уже 0,
@@ -492,7 +560,7 @@ class ChunkInstaller:
                     assemble_pool.submit(_assemble, i)
 
             next_idx = 0
-            in_flight: Dict[object, str] = {}
+            in_flight: Dict[object, List[str]] = {}
 
             def _submit_more():
                 nonlocal next_idx
@@ -500,16 +568,21 @@ class ChunkInstaller:
                 # потолок памяти заполнен и НИ ОДИН файл ещё не готов
                 # (некому освободить кэш), без этого условия закачка
                 # застревала бы навсегда. Когда in_flight пуст, потолок
-                # игнорируется ровно на один чанк — гарантирует прогресс.
-                while (next_idx < len(chunk_order)
+                # игнорируется ровно на одну задачу — гарантирует прогресс.
+                # Единица отсчёта — ЗАДАЧА (пачка чанков из одного Range-
+                # запроса, см. _group_for_batch()), не отдельный чанк:
+                # self.max_workers по-прежнему ограничивает число
+                # одновременных HTTP-соединений, каждое теперь просто
+                # может нести больше одного чанка за раз.
+                while (next_idx < len(tasks)
                        and len(in_flight) < self.max_workers
                        and (not cache.full() or not in_flight)):
-                    cid = chunk_order[next_idx]
+                    task = tasks[next_idx]
                     next_idx += 1
-                    in_flight[pool.submit(_dl, cid)] = cid
+                    in_flight[pool.submit(_dl_batch, task)] = task
 
             _submit_more()
-            while in_flight or next_idx < len(chunk_order):
+            while in_flight or next_idx < len(tasks):
                 if self.should_stop():
                     for f in in_flight:
                         f.cancel()
@@ -529,35 +602,37 @@ class ChunkInstaller:
                     continue
 
                 future = done_set.pop()
-                cid = in_flight.pop(future)
-                data = future.result()
+                task_cids = in_flight.pop(future)
+                results = future.result()
                 ready: List[int] = []
                 with stats_lock:
-                    done += 1
+                    for cid in task_cids:
+                        data = results.get(cid)
+                        done += 1
+
+                        if data is None:
+                            failed_chunk_ids.add(cid)
+                            self._dbg(f"🐛 dl {cid[:12]} FAIL -> dooming files={chunk_to_files[cid]}")
+                            for i in chunk_to_files[cid]:
+                                if doomed[i]:
+                                    continue
+                                doomed[i] = True
+                                fail_files += 1
+                                cache.release(file_chunk_ids[i])
+                        else:
+                            cache.put(cid, data)
+                            downloaded_bytes += len(data)
+                            self._dbg(f"🐛 dl {cid[:12]} OK {len(data)}B")
+                            for i in chunk_to_files[cid]:
+                                if doomed[i]:
+                                    continue
+                                remaining[i] -= 1
+                                if remaining[i] == 0:
+                                    ready.append(i)
+                    if ready:
+                        self._dbg(f"🐛 ready after batch of {len(task_cids)}: files={ready}")
+
                     self.on_progress(done)
-
-                    if data is None:
-                        failed_chunk_ids.add(cid)
-                        self._dbg(f"🐛 dl {cid[:12]} FAIL -> dooming files={chunk_to_files[cid]}")
-                        for i in chunk_to_files[cid]:
-                            if doomed[i]:
-                                continue
-                            doomed[i] = True
-                            fail_files += 1
-                            cache.release(file_chunk_ids[i])
-                    else:
-                        cache.put(cid, data)
-                        downloaded_bytes += len(data)
-                        self._dbg(f"🐛 dl {cid[:12]} OK {len(data)}B")
-                        for i in chunk_to_files[cid]:
-                            if doomed[i]:
-                                continue
-                            remaining[i] -= 1
-                            if remaining[i] == 0:
-                                ready.append(i)
-                        if ready:
-                            self._dbg(f"🐛 ready after {cid[:12]}: files={ready}")
-
                     pct = int(done / len(needed_chunks) * 100) if needed_chunks else 100
                     now = time.time()
                     sample_dt = now - last_sample_t
