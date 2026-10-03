@@ -182,6 +182,97 @@ def _plan_chunk_order(to_process: List[FileEntry], file_chunk_ids: List[Set[str]
     return order
 
 
+def _pack_layout_is_file_ordered(to_process: List[FileEntry], client, sample_files: int = 50) -> bool:
+    """Эвристика: сэмплирует до `sample_files` файлов с ≥2 уникальными
+    чанками и проверяет, лежат ли их чанки в ОДНОМ pack подряд по
+    offset'у — тот же сигнал, что `batch_bench.py`'s `sim`-режим уже
+    посчитал на реальных данных ("соседние по offset'у чанки ОДНОГО
+    файла лежат в pack ВСТЫК") — 0.0% означает классическую раскладку
+    `pack_writer.py` по `sorted(chunk_id)` (по хэшу публикации, см.
+    "Batch-Range закачка чанков..." в CLAUDE.md), близко к 100% — более
+    новую раскладку, где контент каждого файла физически смежен в
+    одном pack. Порог 80% — не 100%, чтобы редкие "рваные" случаи
+    (шаринг чанка между файлами, чанк на границе pack) не отключали
+    оптимизацию из-за единичных исключений.
+
+    Выбор стратегии дальше (см. `install()`) — при файловой раскладке
+    чтение пачек ПОСЛЕДОВАТЕЛЬНО безопасно и для памяти (чанки файла и
+    так приходят рядом по времени, раз физически смежны), и для диска
+    сервера; пересортировка "маленькие файлы первыми"
+    (`_plan_chunk_order`, живой OOM-фикс 2026-09-23) в этом случае не
+    нужна и только мешала бы последовательному чтению pack-файлов.
+
+    getattr-детект — клиент без `get_chunk_location_full()` (легаси
+    WebDAV, тестовые дублёры) не умеет ответить, трактуется как "не
+    файловая раскладка" — безопасный, уже проверенный путь ниже."""
+    get_loc = getattr(client, "get_chunk_location_full", None)
+    if get_loc is None:
+        return False
+    pairs = adjacent = 0
+    checked = 0
+    for e in to_process:
+        if len(e.chunks) < 2:
+            continue
+        checked += 1
+        if checked > sample_files:
+            break
+        chunks = sorted(e.chunks, key=lambda c: c.offset)
+        for a, b in zip(chunks, chunks[1:]):
+            la = get_loc(a.chunk_id)
+            lb = get_loc(b.chunk_id)
+            if la is None or lb is None:
+                continue
+            pairs += 1
+            if la[0] == lb[0] and 0 <= lb[1] - (la[1] + la[2]) <= _BATCH_GAP_BYTES:
+                adjacent += 1
+    if pairs == 0:
+        return False
+    return (adjacent / pairs) >= 0.8
+
+
+def _plan_chunk_order_packed(to_process: List[FileEntry], file_chunk_ids: List[Set[str]], client) -> List[str]:
+    """Порядок закачки для файлово-ориентированной раскладки pack (см.
+    `_pack_layout_is_file_ordered()`) — читает паки ПОСЛЕДОВАТЕЛЬНО
+    (глобальная сортировка по `(pack, offset)`, без оконного реордера
+    `_reorder_for_disk_locality()` — он здесь избыточен, вся очередь уже
+    в физическом порядке), а не "сначала маленькие файлы"
+    (`_plan_chunk_order`). При этой раскладке оба требования — дисковая
+    локальность на сервере и память на клиенте — совпадают сами собой:
+    раз чанки каждого файла физически смежны в одном pack,
+    последовательное чтение и так приносит чанки каждого файла рядом
+    друг с другом по времени, искусственно переставлять файлы по
+    размеру не нужно.
+
+    Дедуп общих chunk_id (шаринг между файлами) — тот же принцип, что в
+    `_plan_chunk_order()`: чанк попадает в очередь один раз, порядок
+    между файлами здесь не важен (в отличие от того фикса) — позицию в
+    итоговой очереди определяет ТОЛЬКО физическое расположение.
+
+    Клиент без `get_chunk_location_full()` сюда попасть не должен —
+    вызывающий код сам решает через `_pack_layout_is_file_ordered()` —
+    но если всё же попал, безопасный фолбэк на `_plan_chunk_order()`."""
+    get_loc = getattr(client, "get_chunk_location_full", None)
+    if get_loc is None:
+        return _plan_chunk_order(to_process, file_chunk_ids)
+    seen: Set[str] = set()
+    all_ids: List[str] = []
+    for ids in file_chunk_ids:
+        for cid in sorted(ids):
+            if cid not in seen:
+                seen.add(cid)
+                all_ids.append(cid)
+
+    def _key(cid: str):
+        loc = get_loc(cid)
+        if loc is None:
+            return (1, "", 0)
+        pack, off, _size = loc
+        return (0, pack, off)
+
+    all_ids.sort(key=_key)
+    return all_ids
+
+
 class _ChunkCache:
     """Владеет байтами чанков и их refcount'ом за одним lock'ом — вся
     разделяемая изменяемая память установки в одном месте. `release()`
@@ -548,8 +639,14 @@ class ChunkInstaller:
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool, \
              ThreadPoolExecutor(max_workers=assemble_workers) as assemble_pool:
 
-            chunk_order = _plan_chunk_order(to_process, file_chunk_ids)
-            chunk_order = _reorder_for_disk_locality(chunk_order, self.client, self.max_workers)
+            if _pack_layout_is_file_ordered(to_process, self.client):
+                self.on_log("📐 Раскладка pack: по файлам — читаем pack последовательно")
+                chunk_order = _plan_chunk_order_packed(to_process, file_chunk_ids, self.client)
+            else:
+                self.on_log("📐 Раскладка pack: по хэшу (старая публикация) — порядок по файлам, случайное чтение")
+                chunk_order = _plan_chunk_order(to_process, file_chunk_ids)
+                chunk_order = _reorder_for_disk_locality(chunk_order, self.client, self.max_workers)
+
             tasks = _group_for_batch(chunk_order, self.client, _BATCH_BYTES, _BATCH_GAP_BYTES)
 
             # Файлы БЕЗ чанков (size=0, реальные пустые файлы в манифесте)
