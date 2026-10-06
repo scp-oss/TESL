@@ -43,12 +43,12 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QMetaObject, Q_ARG, pyqtSlot
-from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QPixmap, QFont
+from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QRectF, QMetaObject, Q_ARG, pyqtSlot
+from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QPixmap, QFont, QPainter, QPainterPath
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QProgressBar, QTextEdit, QFileDialog, QFrame, QComboBox,
-    QSizePolicy, QMessageBox, QApplication,
+    QMessageBox, QApplication,
 )
 
 from config import (
@@ -64,6 +64,10 @@ from core.patcher import SkyrimPatcher
 from core.depot_client import DepotClient
 from core.debug_log import maybe_upload_debug_log
 from ui.settings_dialog import SettingsDialog
+from ui.theme import (
+    make_frameless, wrap_in_card, TitleBar, SCROLLBAR_QSS, circle_btn_qss,
+    qrgba, ACCENT, ACCENT_TEXT,
+)
 
 try:
     import winreg as _winreg
@@ -77,16 +81,36 @@ DONATE_URL = "https://www.donationalerts.com/"   # замени на свой
 # ── Poster widget ─────────────────────────────────────────────────────────────
 
 class PosterWidget(QLabel):
-    """300×480 px постер. Показывает заглушку пока не загружен."""
+    """Постер сборки, размер/скругление — по макету (Main.dc.html: 266×380,
+    radius 20px). QSS border-radius на QLabel НЕ обрезает pixmap, который
+    на него ставят (Qt рисует фон со скруглением, но сам setPixmap() поверх
+    без клипа) — та же ловушка, из-за которой BuildTile в карусели держит
+    постер внутри card с отступом, чтобы прямые углы картинки прятались под
+    padding'ом. Здесь постер — не внутри отдельной карточки (как в макете:
+    изображение заполняет скруглённый контейнер вплотную, без отступа) —
+    вместо этого paintEvent() сам клипит ВСЁ рисование (фон/текст/pixmap)
+    по QPainterPath скруглённого прямоугольника."""
 
-    W, H = 300, 420
+    W, H = 266, 380
+    RADIUS = 20
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(self.W, self.H)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("background: #1a1a1a; border-radius: 8px; color: #555;")
+        self.setStyleSheet(
+            f"background: #1a1a1e; color: {qrgba(255,255,255,0.45)}; "
+            f"border: 1px solid {qrgba(255,255,255,0.09)}; font-size: 10pt;"
+        )
         self.setText("Загрузка постера...")
+
+    def paintEvent(self, event):
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), self.RADIUS, self.RADIUS)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setClipPath(path)
+        super().paintEvent(event)
 
     def set_image(self, data: bytes):
         try:
@@ -146,8 +170,12 @@ class UpdaterUI(QWidget):
         icon_path = get_asset_path("icon.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
-        self.resize(780, 500)
-        self.setMinimumSize(700, 440)
+        # Размер — по макету (Main.dc.html: 1040×700), а не прежние 780×500 —
+        # "стеклянная" раскладка (постер 266×380 + правая колонка с версиями
+        # и глубоким глянцевым текстовым полем) заметно просторнее прежней
+        # плотной компоновки, 780×500 оставляли бы правую колонку сжатой.
+        self.resize(1040, 700)
+        self.setMinimumSize(820, 560)
 
         # ── State ─────────────────────────────────────────────────────────────
         self.is_installing   = False
@@ -220,24 +248,47 @@ class UpdaterUI(QWidget):
     # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        main_v = QVBoxLayout(self)
-        main_v.setContentsMargins(10, 8, 10, 6)
-        main_v.setSpacing(6)
+        """Та же "стеклянная" оболочка, что уже доказала себя на карусели
+        (см. ui/theme.py/ui/carousel_window.py, прямой запрос пользователя
+        2026-10-06 "привести интерфейс к виду как на макете") — безрамочное
+        окно + одна карточка с кастомным тайтлбаром вместо системной рамки.
+        Это ВИЗУАЛЬНЫЙ перенос: каждый функциональный виджет (кнопки/комбобокс/
+        прогресс-бар/лог) остаётся ТЕМ ЖЕ объектом с теми же именами
+        (self.btn_launch, self.combo_versions, ...) и сигналами
+        (_connect_signals() ниже не менялся) — меняется только то, в каком
+        контейнере и с каким QSS он показан.
 
-        # ── Top bar ───────────────────────────────────────────────────────────
-        top = QHBoxLayout()
-        top.setSpacing(12)
+        Сознательные упрощения относительно макета (Main.dc.html), чтобы не
+        рисковать логикой ради точного визуального соответствия — см.
+        CLAUDE.md "Главное окно: стеклянная оболочка..." за полный список:
+        кнопка "назад" к карусели не добавлена (main.py не умеет пересоздавать
+        CarouselWindow — отдельная, не запрошенная задача); лог остаётся
+        отдельной панелью под контентом, а не оверлеем поверх описания версии;
+        три отдельные кнопки версии (Последняя/Обновить/Откат) сохранены как
+        есть, хотя в макете их роль целиком на одной умной CTA-кнопке — у
+        них разная семантика (принудительное обновление до последней/до
+        выбранной vs просто "играть/откатиться"), убирать функциональность
+        не просили."""
+        make_frameless(self)
+        card = wrap_in_card(self, radius=22)
+        self._card = card   # нужен _apply_dark()/_apply_light() ниже — фон
+                             # самой карточки пересобирается вместе с темой
+        card_v = QVBoxLayout(card)
+        card_v.setContentsMargins(0, 0, 0, 0)
+        card_v.setSpacing(0)
 
+        title_bar = TitleBar()
+        card_v.addWidget(title_bar)
+
+        # ── Доп. виджеты тайтлбара (папка/ярлык/настройки/тема) ─────────────
         self.lbl_folder = QLabel("📁 Выбрать папку")
+        self.lbl_folder.setObjectName("TeslChip")
         self.lbl_folder.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_folder.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.lbl_folder.setMaximumWidth(280)
 
-        self.lbl_shortcut = QLabel("🏷️ Создать ярлык")
+        self.lbl_shortcut = QLabel("🏷 Ярлык")
+        self.lbl_shortcut.setObjectName("TeslChip")
         self.lbl_shortcut.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_shortcut.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-        self.lbl_version = QLabel(self._format_version_label("не установлена"))
-        self.lbl_version.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         # Единственная точка входа для всего "не главного" функционала —
         # прямой запрос пользователя 2026-10-06, тем же днём: отдельная
@@ -245,25 +296,20 @@ class UpdaterUI(QWidget):
         # ОТКАЧЕНА ("меню сборки и настройки это должно быть одно и то же
         # в одном месте") — см. _open_settings()/ui/settings_dialog.py.
         self.btn_settings = QPushButton("⚙")
-        self.btn_settings.setFixedSize(32, 32)
+        self.btn_settings.setFixedSize(30, 30)
+        self.btn_settings.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_settings.setToolTip("Настройки")
+        self.btn_settings.setStyleSheet(circle_btn_qss())
         self.btn_settings.clicked.connect(self._open_settings)
 
         self.btn_theme = QPushButton("🌙")
-        self.btn_theme.setFixedSize(32, 32)
+        self.btn_theme.setFixedSize(30, 30)
+        self.btn_theme.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_theme.setStyleSheet(circle_btn_qss())
         self.btn_theme.clicked.connect(self._toggle_theme)
 
-        top.addWidget(self.lbl_folder)
-        top.addWidget(self.lbl_shortcut)
-        top.addStretch()
-        top.addWidget(self.lbl_version)
-        top.addWidget(self.btn_settings)
-        top.addWidget(self.btn_theme)
-        main_v.addLayout(top)
-
-        # ── Content row ───────────────────────────────────────────────────────
-        content = QHBoxLayout()
-        content.setSpacing(10)
+        for w in (self.lbl_folder, self.lbl_shortcut, self.btn_settings, self.btn_theme):
+            title_bar.extra_layout.addWidget(w)
 
         # Кнопки диалога настроек (⚙) — прямой запрос пользователя
         # 2026-09-22, пересмотрено 2026-10-06: "🔨 Пропатчить Skyrim"/
@@ -292,107 +338,128 @@ class UpdaterUI(QWidget):
         self.btn_move_install = QPushButton("📂 Перенести в другое место")
         self.settings_dialog = None   # создаётся лениво, один раз — см. _open_settings()
 
-        # Растяжка слева от центра — без своей левой колонки (190px) центр+
-        # правая панель (340+230+10=580) уже не заполняют всю ширину окна
-        # (780) сами по себе; без stretch'ей блок прижимался бы к левому
-        # краю с некрасивой пустотой справа — с ними он по центру.
-        content.addStretch(1)
+        # ── Тело окна ─────────────────────────────────────────────────────────
+        body = QVBoxLayout()
+        body.setContentsMargins(20, 16, 20, 4)
+        body.setSpacing(14)
+        card_v.addLayout(body)
 
-        # Center panel — постер + кнопка запуска
-        center = QFrame()
-        center.setFixedWidth(340)
-        cv = QVBoxLayout(center)
-        cv.setContentsMargins(0, 0, 0, 0)
-        cv.setSpacing(6)
+        content = QHBoxLayout()
+        content.setSpacing(18)
+        body.addLayout(content, 1)
+
+        # Левая колонка — постер + CTA + прогресс
+        left = QVBoxLayout()
+        left.setSpacing(12)
+        content.addLayout(left)
 
         self.poster = PosterWidget()
-        cv.addWidget(self.poster, alignment=Qt.AlignmentFlag.AlignCenter)
+        left.addWidget(self.poster)
 
         self.btn_launch = QPushButton("▶  TESVAE")
-        self.btn_launch.setFixedHeight(38)
-        self.btn_launch.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        cv.addWidget(self.btn_launch)
-        content.addWidget(center)
+        self.btn_launch.setObjectName("TeslCTA")
+        self.btn_launch.setFixedHeight(52)
+        self.btn_launch.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_launch.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
+        left.addWidget(self.btn_launch)
 
-        # Right panel — версии
-        right = QFrame()
-        right.setFixedWidth(230)
-        rv = QVBoxLayout(right)
-        rv.setSpacing(6)
+        progress_card = QFrame()
+        progress_card.setObjectName("TeslGlassCard")
+        pc_h = QHBoxLayout(progress_card)
+        pc_h.setContentsMargins(10, 8, 10, 8)
+        pc_h.setSpacing(10)
 
-        rv.addWidget(QLabel("Выберите версию:"))
-        self.combo_versions = QComboBox()
-        self.combo_versions.addItem("Загрузка...")
-        self.combo_versions.setFixedHeight(34)
-        rv.addWidget(self.combo_versions)
-
-        self.btn_latest   = QPushButton("🆕 Последняя")
-        self.btn_update   = QPushButton("🔼 Обновить до выбранной")
-        self.btn_rollback = QPushButton("↩️ Откат к выбранной")
-
-        for b in (self.btn_latest, self.btn_update, self.btn_rollback):
-            b.setFixedHeight(34)
-            rv.addWidget(b)
-
-        rv.addStretch()
-
-        # Информация о версии
-        rv.addWidget(QLabel("Информация о версии:"))
-        self.lbl_version_info = QTextEdit()
-        self.lbl_version_info.setReadOnly(True)
-        self.lbl_version_info.setMaximumHeight(80)
-        self.lbl_version_info.setPlaceholderText("Описание добавим позже")
-        rv.addWidget(self.lbl_version_info)
-
-        content.addWidget(right)
-        content.addStretch(1)
-        main_v.addLayout(content)
-
-        # ── Progress bar ──────────────────────────────────────────────────────
-        prog_row = QHBoxLayout()
         self.progress = QProgressBar()
-        self.progress.setFixedHeight(20)
+        self.progress.setObjectName("TeslProgress")
+        self.progress.setFixedHeight(26)
         self.progress.setValue(0)
         self.progress.setFormat("")
         self.progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        prog_row.addWidget(self.progress, 1)
+        pc_h.addWidget(self.progress, 1)
 
         self.btn_pause = QPushButton("⏸ Пауза")
-        self.btn_pause.setFixedSize(QSize(90, 32))
+        self.btn_pause.setObjectName("TeslGhostBtn")
+        self.btn_pause.setFixedSize(QSize(92, 26))
+        self.btn_pause.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_pause.setEnabled(False)
-        prog_row.addWidget(self.btn_pause)
-        main_v.addLayout(prog_row)
+        pc_h.addWidget(self.btn_pause)
 
-        # ── Log ───────────────────────────────────────────────────────────────
+        left.addWidget(progress_card)
+
+        # Правая колонка — версии
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        content.addLayout(right, 1)
+
+        lbl_choose = QLabel("Выберите версию")
+        lbl_choose.setObjectName("TeslFieldLabel")
+        right.addWidget(lbl_choose)
+
+        self.combo_versions = QComboBox()
+        self.combo_versions.setObjectName("TeslCombo")
+        self.combo_versions.addItem("Загрузка...")
+        self.combo_versions.setFixedHeight(38)
+        self.combo_versions.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        right.addWidget(self.combo_versions)
+
+        self.btn_latest   = QPushButton("🆕 Последняя")
+        self.btn_update   = QPushButton("🔼 Обновить до выбранной")
+        self.btn_rollback = QPushButton("↩ Откат к выбранной")
+        for b in (self.btn_latest, self.btn_update, self.btn_rollback):
+            b.setObjectName("TeslGhostBtn")
+            b.setFixedHeight(32)
+            b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            right.addWidget(b)
+
+        lbl_info = QLabel("Информация о версии")
+        lbl_info.setObjectName("TeslFieldLabel")
+        right.addWidget(lbl_info)
+
+        self.lbl_version_info = QTextEdit()
+        self.lbl_version_info.setObjectName("TeslGlassText")
+        self.lbl_version_info.setReadOnly(True)
+        self.lbl_version_info.setPlaceholderText("Описание добавим позже")
+        right.addWidget(self.lbl_version_info, 1)
+
+        # ── Лог — отдельная панель под контентом (не оверлей, как в
+        # макете, — см. докстринг метода выше) ─────────────────────────────
         self.log = QTextEdit()
+        self.log.setObjectName("TeslLog")
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(140)
+        self.log.setMaximumHeight(130)
         self.log.setFont(QFont("Consolas", 9))
-        main_v.addWidget(self.log)
+        body.addWidget(self.log)
 
-        # ── Bottom bar ────────────────────────────────────────────────────────
+        # ── Нижняя панель ─────────────────────────────────────────────────────
         bottom = QHBoxLayout()
+        bottom.setContentsMargins(20, 4, 20, 14)
+        bottom.setSpacing(6)
 
         self.lbl_send_report = QLabel("📤 Отправить репорт")
+        self.lbl_send_report.setObjectName("TeslLinkBtn")
         self.lbl_send_report.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_send_report.setStyleSheet("color: #4a9eff;")
 
-        self.lbl_donate = QLabel("❤️ Поддержать разработчиков")
+        self.lbl_donate = QLabel("❤ Поддержать разработчиков")
+        self.lbl_donate.setObjectName("TeslLinkBtnDonate")
         self.lbl_donate.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_donate.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_donate.setStyleSheet("color: #e06c75;")
 
         self.lbl_show_log = QLabel("📋 Показать лог")
+        self.lbl_show_log.setObjectName("TeslLinkBtn")
         self.lbl_show_log.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.lbl_show_log.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.lbl_show_log.setStyleSheet("color: #4a9eff;")
+
+        # Текущая версия + коммит лаунчера — в макете это правый нижний
+        # моноширинный текст ("TESL [commit vers]"), здесь несёт больше
+        # смысла (обе версии, не только билд лаунчера), но тот же угол.
+        self.lbl_version = QLabel(self._format_version_label("не установлена"))
+        self.lbl_version.setObjectName("TeslMonoFooter")
 
         bottom.addWidget(self.lbl_send_report)
-        bottom.addStretch()
         bottom.addWidget(self.lbl_donate)
-        bottom.addStretch()
+        bottom.addStretch(1)
         bottom.addWidget(self.lbl_show_log)
-        main_v.addLayout(bottom)
+        bottom.addSpacing(10)
+        bottom.addWidget(self.lbl_version)
+        card_v.addLayout(bottom)
 
     # ── Signals ───────────────────────────────────────────────────────────────
 
@@ -1608,38 +1675,112 @@ class UpdaterUI(QWidget):
         self.progress.setValue(current)
 
     # ── Theme ─────────────────────────────────────────────────────────────────
+    # Палитра "стекла" из макета (Main.dc.html: `.tesl`/`.tesl.light` CSS
+    # custom properties) вместо прежних generic Qt dark/light QSS (которые
+    # и давали "обычное системное окно" на скриншотах, см. CLAUDE.md). Окно
+    # ДЕЛИБЕРАТИВНО упрощено относительно макета в одном месте: сама
+    # карточка/тайтлбар (см. ui/theme.py::wrap_in_card()/TitleBar) остаётся
+    # тёмной всегда — переключатель темы меняет тон только самого контента
+    # (чипы/кнопки/комбобокс/текстовые панели) поверх неё, не фон карточки
+    # целиком. Полная светлая тема потребовала бы параметризовать
+    # wrap_in_card()/TitleBar по палитре — они общие с уже отгруженной
+    # каруселью (которая темы не переключает вообще), трогать это ради
+    # главного окна отдельной, не запрошенной задачей не стал.
 
-    _dark_ss = """
-        QWidget { background: #2b2b2b; color: #ddd; font-family: "Segoe UI"; font-size: 10pt; }
-        QPushButton { background: #3a3a3a; border: 1px solid #555; border-radius: 6px; padding: 6px; color: #eee; }
-        QPushButton:hover { background: #505050; }
-        QPushButton:disabled { background: #2e2e2e; color: #666; border-color: #444; }
-        QProgressBar { border-radius: 6px; background: #444; height: 18px; color: white; text-align: center; }
-        QProgressBar::chunk { border-radius: 6px; background: #16a34a; }
-        QTextEdit { background: #1e1e1e; border: 1px solid #555; border-radius: 6px; color: #ddd; }
-        QComboBox { background: #3a3a3a; border: 1px solid #555; border-radius: 6px; color: #ddd; padding: 4px; }
-        QLabel { color: #ddd; }
-    """
-    _light_ss = """
-        QWidget { background: #f6f7fb; color: #222; font-family: "Segoe UI"; font-size: 10pt; }
-        QPushButton { background: #fff; border: 1px solid #d6dbe8; border-radius: 6px; padding: 6px; }
-        QPushButton:hover { background: #eef5ff; }
-        QPushButton:disabled { background: #e8e8e8; color: #999; }
-        QProgressBar { border-radius: 6px; background: #e9eefb; height: 18px; text-align: center; }
-        QProgressBar::chunk { border-radius: 6px; background: #4ade80; }
-        QTextEdit { background: #fff; border: 1px solid #e1e6f2; border-radius: 6px; }
-        QComboBox { background: #fff; border: 1px solid #d6dbe8; border-radius: 6px; padding: 4px; }
-    """
+    _PALETTE_DARK = dict(
+        bg_soft="#17171B", text="#F3F3F5", text2="#A7A7AE", text3="#74747B",
+        hairline=qrgba(255, 255, 255, 0.09), hairline_strong=qrgba(255, 255, 255, 0.16),
+        glass_fill=qrgba(255, 255, 255, 0.055), glass_border=qrgba(255, 255, 255, 0.14),
+        hover=qrgba(255, 255, 255, 0.10), track=qrgba(255, 255, 255, 0.10),
+        log_text="#C7C7CC",
+    )
+    _PALETTE_LIGHT = dict(
+        bg_soft="#F6F6F8", text="#1B1B1E", text2="#5B5B62", text3="#8B8B91",
+        hairline=qrgba(0, 0, 0, 0.08), hairline_strong=qrgba(0, 0, 0, 0.14),
+        glass_fill=qrgba(255, 255, 255, 0.55), glass_border=qrgba(255, 255, 255, 0.7),
+        hover=qrgba(0, 0, 0, 0.06), track=qrgba(0, 0, 0, 0.06),
+        log_text="#3A3A40",
+    )
 
     _current_theme = "light"
 
+    def _build_theme_qss(self, dark: bool) -> str:
+        p = self._PALETTE_DARK if dark else self._PALETTE_LIGHT
+        accent_soft   = qrgba(47, 143, 224, 0.55)
+        accent_hover  = qrgba(47, 143, 224, 0.70)
+        donate        = "#E06C75"
+        donate_hover  = qrgba(224, 108, 117, 0.16)
+        select_bg     = qrgba(47, 143, 224, 0.35)
+        return f"""
+            QWidget {{ color: {p['text']}; font-family: "Segoe UI"; font-size: 10pt; }}
+            QLabel {{ color: {p['text']}; background: transparent; }}
+
+            QLabel#TeslFieldLabel {{ color: {p['text2']}; font-size: 9pt; font-weight: 500; }}
+            QLabel#TeslMonoFooter {{ color: {p['text3']}; font-family: Consolas, monospace; font-size: 8pt; }}
+
+            QLabel#TeslChip {{
+                background: {p['glass_fill']}; border: 1px solid {p['glass_border']};
+                border-radius: 15px; padding: 5px 12px; color: {p['text2']}; font-size: 9pt;
+            }}
+            QLabel#TeslChip:hover {{ background: {p['hover']}; }}
+
+            QLabel#TeslLinkBtn {{ color: {ACCENT}; font-size: 9pt; border-radius: 12px; padding: 4px 8px; }}
+            QLabel#TeslLinkBtn:hover {{ background: {p['hover']}; }}
+            QLabel#TeslLinkBtnDonate {{ color: {donate}; font-size: 9pt; border-radius: 12px; padding: 4px 8px; }}
+            QLabel#TeslLinkBtnDonate:hover {{ background: {donate_hover}; }}
+
+            QPushButton#TeslCTA {{
+                background: {accent_soft}; border: 1px solid {qrgba(255,255,255,0.28)};
+                border-radius: 26px; color: #FFFFFF;
+            }}
+            QPushButton#TeslCTA:hover {{ background: {accent_hover}; }}
+            QPushButton#TeslCTA:disabled {{ background: {p['glass_fill']}; color: {p['text3']}; border-color: {p['hairline']}; }}
+
+            QFrame#TeslGlassCard {{
+                background: {p['glass_fill']}; border: 1px solid {p['glass_border']}; border-radius: 16px;
+            }}
+
+            QPushButton#TeslGhostBtn {{
+                background: transparent; border: 1px solid {p['hairline_strong']}; border-radius: 16px;
+                color: {p['text2']}; font-size: 9pt;
+            }}
+            QPushButton#TeslGhostBtn:hover {{ background: {p['hover']}; color: {p['text']}; }}
+            QPushButton#TeslGhostBtn:disabled {{ color: {p['text3']}; border-color: {p['hairline']}; }}
+
+            QProgressBar#TeslProgress {{
+                background: {p['track']}; border: none; border-radius: 13px;
+                color: {p['text']}; text-align: center; font-size: 8pt;
+            }}
+            QProgressBar#TeslProgress::chunk {{ background: {ACCENT}; border-radius: 13px; }}
+
+            QComboBox#TeslCombo {{
+                background: {p['glass_fill']}; border: 1px solid {p['glass_border']};
+                border-radius: 14px; color: {p['text']}; padding: 4px 12px; font-size: 9.5pt;
+            }}
+            QComboBox#TeslCombo:hover {{ border-color: {ACCENT}; }}
+            QComboBox#TeslCombo QAbstractItemView {{
+                background: {p['bg_soft']}; color: {p['text']}; border: 1px solid {p['hairline_strong']};
+                selection-background-color: {select_bg};
+            }}
+
+            QTextEdit#TeslGlassText {{
+                background: {p['glass_fill']}; border: 1px solid {p['glass_border']}; border-radius: 16px;
+                color: {p['text2']}; padding: 12px; font-size: 9.5pt;
+            }}
+            QTextEdit#TeslLog {{
+                background: {p['glass_fill']}; border: 1px solid {p['glass_border']}; border-radius: 16px;
+                color: {p['log_text']}; padding: 10px 14px;
+                font-family: Consolas, monospace; font-size: 8.5pt;
+            }}
+        """ + SCROLLBAR_QSS
+
     def _apply_dark(self):
-        self.setStyleSheet(self._dark_ss)
+        self.setStyleSheet(self._build_theme_qss(dark=True))
         self.btn_theme.setText("☀️")
         self._current_theme = "dark"
 
     def _apply_light(self):
-        self.setStyleSheet(self._light_ss)
+        self.setStyleSheet(self._build_theme_qss(dark=False))
         self.btn_theme.setText("🌙")
         self._current_theme = "light"
 
