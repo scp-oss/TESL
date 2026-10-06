@@ -342,6 +342,20 @@ MO2_SKSE_ARG      = "moshortcut://:SKSE"
 MO2_INI_SKYRIM_PLACEHOLDER_FWD = "D:/SteamLibrary/steamapps/common/Skyrim Special Edition"
 MO2_INI_SKYRIM_PLACEHOLDER_DBL = "D:\\\\SteamLibrary\\\\steamapps\\\\common\\\\Skyrim Special Edition"
 
+# Компонент депо "Skyrim" (см. TESL-Manager::COMPONENT_NAMES — Skyrim/
+# MO2p/MO2ext) раскладывается в <local_dir>/Skyrim, соседом MO2p/ —
+# живой инцидент 2026-10-06: `PostInstallWorker` прописывал gamePath=
+# в ModOrganizer.ini только из `SkyrimChecker` (внешний поиск Steam-
+# установки по реестру/дискам) — для сборки, которая возит СВОЙ
+# экземпляр Skyrim как компонент (а не полагается на отдельно
+# установленный через Steam), на ПК без такой внешней установки
+# `SkyrimChecker` ничего не находит, и правка пути вообще не
+# запускается, даже если реальная игра лежит прямо тут же, в составе
+# сборки. Реальный присланный пользователем `ModOrganizer.ini`
+# подтвердил раскладку (`gamePath=.../Skyrim`, `MO2p/explorer++/...` —
+# соседние папки одного `local_dir`).
+SKYRIM_COMPONENT_DIR = "Skyrim"
+
 # ── Worker ────────────────────────────────────────────────────────────────────
 MAX_WORKERS = min(32, max(8, (os.cpu_count() or 4) * 2))
 BATCH_SIZE  = 500

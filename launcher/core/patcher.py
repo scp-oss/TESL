@@ -6,6 +6,7 @@ MO2Configurator — настройка ModOrganizer.ini и создание яр
 """
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -40,6 +41,73 @@ PATCHER_MANIFEST_FILE = APPDATA_DIR / "patcher_manifest.json"
 
 def _normalize(path: str) -> str:
     return path.replace("\\", "/")
+
+
+# "gamePath=..." в ModOrganizer.ini, опционально обёрнутый в
+# "@ByteArray(...)" — так Qt/QSettings сериализует QByteArray-поля
+# ini-форматом, и MO2 исторически хранит gamePath именно так.
+_GAME_PATH_LINE_RE = re.compile(r"^gamePath\s*=\s*(.*)$", re.MULTILINE)
+
+
+def _extract_game_path(content: str) -> Optional[str]:
+    """Текущее значение `gamePath=` из [General] — без обёртки
+    `@ByteArray(...)` и с одиночными обратными слэшами (ini-формат
+    хранит их задвоенными: `P:\\\\Games\\\\...` в тексте файла значит
+    один реальный `\\` в пути)."""
+    m = _GAME_PATH_LINE_RE.search(content)
+    if not m:
+        return None
+    value = m.group(1).strip()
+    if value.startswith("@ByteArray(") and value.endswith(")"):
+        value = value[len("@ByteArray("):-1]
+    return value.replace("\\\\", "\\")
+
+
+def _rewrite_game_path_everywhere(content: str, game_folder: str) -> "tuple[str, bool]":
+    """Заменяет СТАРЫЙ путь к игре на реальный ВЕЗДЕ в тексте файла, не
+    только в строке `gamePath=`.
+
+    Живой инцидент 2026-10-06 (реальный `ModOrganizer.ini` прислан
+    пользователем) показал: тот же абсолютный путь прописан ЕЩЁ и в
+    `[customExecutables]` — `binary=`/`workingDirectory=`/`arguments=`
+    у каждого кастомного ярлыка запуска (SKSE, Creation Kit,
+    SkyrimSELauncher, даже сторонний Explorer++) — если починить
+    только `gamePath=`, MO2 откроется, но КАЖДЫЙ из этих ярлыков
+    запуска останется указывать на несуществующую папку.
+
+    Старый путь берётся ДИНАМИЧЕСКИ из текущего значения `gamePath=`
+    в самом файле (`_extract_game_path()`), не из фиксированного
+    исторического плейсхолдера (`MO2_INI_SKYRIM_PLACEHOLDER_FWD/DBL`,
+    см. `update_ini()`, который срабатывает только один раз и перестаёт
+    находить что заменять, как только тот путь уже где-то подменился —
+    ровно то, что сломалось на второй машине пользователя) — какой бы
+    путь ни был сейчас записан (от машины сборщика пака, от прошлой
+    машины пользователя, что угодно), именно он и есть то, что нужно
+    заменить.
+
+    Заменяет ДВА текстовых представления одного и того же пути —
+    forward-slash (`P:/Games/skyrim/Skyrim`, как в `customExecutables`
+    `binary=`/`workingDirectory=`) и экранированный двойной обратный
+    слэш (`P:\\\\Games\\\\skyrim\\\\Skyrim`, как в `gamePath=
+    @ByteArray(...)` и `arguments=\\"...\\"`) — оба варианта корректно
+    подхватывают и ВЛОЖЕННЫЕ подпути (`.../Skyrim/data`,
+    `.../Skyrim\\\\data`), поскольку это обычная подстрока внутри более
+    длинной строки, а не точное совпадение всей строки целиком."""
+    old_path = _extract_game_path(content)
+    if not old_path:
+        return content, False
+
+    old_fwd = _normalize(old_path)
+    new_fwd = _normalize(game_folder)
+    if old_fwd == new_fwd:
+        return content, False
+
+    old_bs_escaped = old_fwd.replace("/", "\\").replace("\\", "\\\\")
+    new_bs_escaped = new_fwd.replace("/", "\\").replace("\\", "\\\\")
+
+    new_content = content.replace(old_bs_escaped, new_bs_escaped)
+    new_content = new_content.replace(old_fwd, new_fwd)
+    return new_content, new_content != content
 
 
 def _win_path(path) -> str:
@@ -365,13 +433,27 @@ class MO2Configurator:
 
     @staticmethod
     def update_ini(mo2_dir: str, game_folder: str, log=print) -> bool:
-        """Заменяет placeholder-пути в ModOrganizer.ini на реальные.
+        """Прописывает реальный путь к игре в ModOrganizer.ini.
 
         mo2_dir — КОРЕНЬ установки (local_dir), не папка MO2 — MO2_INI уже
         несёт в себе компонентный префикс ("MO2p/ModOrganizer.ini", см.
         config.py), был раньше голым "ModOrganizer.ini" и потому всегда
         искал файл прямо в корне установки, где его в компонентной
         раскладке никогда не было (живой баг 2026-10-06).
+
+        Два механизма одновременно, намеренно не взаимоисключающие:
+        1. Замена литерального пути-плейсхолдера
+           (`MO2_INI_SKYRIM_PLACEHOLDER_FWD/DBL`) — срабатывает только
+           один раз, при первой установке на машине, где шаблон
+           ModOrganizer.ini ещё содержит ровно этот путь.
+        2. `_rewrite_game_path_line()` — ВСЕГДА переписывает саму строку
+           `gamePath=`, идемпотентно, независимо от того, что там уже
+           записано (плейсхолдер, путь другой машины после переноса
+           папки, что угодно). Добавлено после живого инцидента
+           2026-10-06: путь первой машины (`P:\\Games\\skyrim\\Skyrim`)
+           остался в файле навсегда на второй, потому что плейсхолдер
+           там уже был заменён на нечто иное — заменять было больше
+           нечего, механизм (1) молча не делал ничего.
         """
         ini_path = _win_path(os.path.join(mo2_dir, MO2_INI))
         if not os.path.exists(ini_path):
@@ -384,13 +466,27 @@ class MO2Configurator:
             fwd = _normalize(game_folder)
             dbl = game_folder.replace("\\", "\\\\")
 
+            # Сначала — общая замена, пока content ещё несёт ИСТИННЫЙ
+            # текущий gamePath= (нужен _extract_game_path(), см. его
+            # докстринг) — покрывает gamePath= И customExecutables разом.
+            content, rewrote = _rewrite_game_path_everywhere(content, game_folder)
+            # Легаси-замена литерального плейсхолдера — избыточный
+            # безопасный фолбэк: если gamePath= почему-то не распарсился
+            # (строки нет/формат неожиданный), а шаблон всё ещё содержит
+            # ровно этот путь, хоть что-то да заменится.
             content = content.replace(MO2_INI_SKYRIM_PLACEHOLDER_FWD, fwd)
             content = content.replace(MO2_INI_SKYRIM_PLACEHOLDER_DBL, dbl)
 
             with open(ini_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            log("ModOrganizer.ini обновлён ✓")
+            if rewrote:
+                log(f"ModOrganizer.ini обновлён ✓ (путь к игре -> {fwd}, включая customExecutables)")
+            else:
+                log(
+                    "ModOrganizer.ini: gamePath= не найден/уже совпадает — "
+                    "применён только плейсхолдер-фолбэк, проверьте файл вручную"
+                )
             return True
         except Exception as e:
             log(f"Ошибка обновления INI: {e}")

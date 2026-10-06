@@ -653,9 +653,25 @@ class PostInstallWorker(ThreadSafeWorker):
         from core.ini_profile import apply_ini_profile
 
         try:
-            result = SkyrimChecker().check(log=self.log.emit)
-            if result.found:
-                MO2Configurator.update_ini(self.local_dir, result.skyrim_dir, log=self.log.emit)
+            # Приоритет 1: Skyrim как компонент ЭТОЙ ЖЕ сборки
+            # (<local_dir>/Skyrim, см. config.SKYRIM_COMPONENT_DIR) —
+            # детерминированно, без похода в реестр/по дискам. Живой
+            # инцидент 2026-10-06: на ПК без отдельно установленного
+            # через Steam Skyrim `SkyrimChecker` ничего не находит
+            # (result.found=False), и update_ini() раньше вообще не
+            # вызывалась, хотя реальная игра лежала прямо тут же, в
+            # составе этой сборки — путь в ModOrganizer.ini навсегда
+            # оставался тем, что был записан при публикации/на прошлой
+            # машине. SkyrimChecker (внешний поиск) — фолбэк только для
+            # сборок, которые НЕ возят Skyrim как компонент.
+            bundled_skyrim_dir = os.path.join(self.local_dir, _config.SKYRIM_COMPONENT_DIR)
+            if os.path.isdir(bundled_skyrim_dir):
+                self.log.emit(f"Skyrim найден в составе сборки: {bundled_skyrim_dir}")
+                MO2Configurator.update_ini(self.local_dir, bundled_skyrim_dir, log=self.log.emit)
+            else:
+                result = SkyrimChecker().check(log=self.log.emit)
+                if result.found:
+                    MO2Configurator.update_ini(self.local_dir, result.skyrim_dir, log=self.log.emit)
 
             # Skyrim.ini/SkyrimPrefs.ini (Documents\My Games\...) — не
             # зависит от того, нашёлся ли Skyrim выше: папка должна быть

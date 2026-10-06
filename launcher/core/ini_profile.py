@@ -53,6 +53,55 @@ import config
 
 _PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
 
+_ENUM_CURRENT_SETTINGS = -1
+
+
+class _DEVMODEW(ctypes.Structure):
+    """Подмножество полей WinAPI `DEVMODEW`, нужное для чтения текущего
+    видеорежима через `EnumDisplaySettingsW` — байтовые смещения до
+    `dmPelsWidth`/`dmPelsHeight` совпадают с реальной структурой
+    независимо от того, что именно объявлено в union-блоке между
+    `dmDriverExtra` и `dmColor` (printer-specific поля здесь занимают
+    ровно те же 16 байт, что display-specific `dmPosition`/
+    `dmDisplayOrientation`/`dmDisplayFixedOutput` — нужные нам поля идут
+    ПОСЛЕ этого union, значения самого union не читаются)."""
+    _fields_ = [
+        ("dmDeviceName", ctypes.c_wchar * 32),
+        ("dmSpecVersion", ctypes.c_ushort),
+        ("dmDriverVersion", ctypes.c_ushort),
+        ("dmSize", ctypes.c_ushort),
+        ("dmDriverExtra", ctypes.c_ushort),
+        ("dmFields", ctypes.c_ulong),
+        ("dmOrientation", ctypes.c_short),
+        ("dmPaperSize", ctypes.c_short),
+        ("dmPaperLength", ctypes.c_short),
+        ("dmPaperWidth", ctypes.c_short),
+        ("dmScale", ctypes.c_short),
+        ("dmCopies", ctypes.c_short),
+        ("dmDefaultSource", ctypes.c_short),
+        ("dmPrintQuality", ctypes.c_short),
+        ("dmColor", ctypes.c_short),
+        ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short),
+        ("dmTTOption", ctypes.c_short),
+        ("dmCollate", ctypes.c_short),
+        ("dmFormName", ctypes.c_wchar * 32),
+        ("dmLogPixels", ctypes.c_ushort),
+        ("dmBitsPerPel", ctypes.c_ulong),
+        ("dmPelsWidth", ctypes.c_ulong),
+        ("dmPelsHeight", ctypes.c_ulong),
+        ("dmDisplayFlags", ctypes.c_ulong),
+        ("dmDisplayFrequency", ctypes.c_ulong),
+        ("dmICMMethod", ctypes.c_ulong),
+        ("dmICMIntent", ctypes.c_ulong),
+        ("dmMediaType", ctypes.c_ulong),
+        ("dmDitherType", ctypes.c_ulong),
+        ("dmReserved1", ctypes.c_ulong),
+        ("dmReserved2", ctypes.c_ulong),
+        ("dmPanningWidth", ctypes.c_ulong),
+        ("dmPanningHeight", ctypes.c_ulong),
+    ]
+
 _TEMPLATE_FILES = ("Skyrim.ini", "SkyrimPrefs.ini")
 
 UNKNOWN_GPU = "Unknown GPU"
@@ -220,7 +269,36 @@ def _ensure_dpi_aware() -> None:
 
 
 def _detect_resolution() -> Tuple[int, int]:
+    """Живой отчёт пользователя: даже после `_ensure_dpi_aware()` +
+    `GetSystemMetrics` разрешение в применённом `SkyrimPrefs.ini`
+    по-прежнему не совпадало с реальным экраном ("всё ещё разрешение не
+    на весь экран") — вероятная причина: PyQt6/Qt уже выставляет
+    СВОЙ DPI-awareness context ДО того, как этот код вообще успевает
+    вызваться (кнопка кликается уже внутри запущенного GUI) — повторный
+    `SetProcessDpiAwareness()` в этом случае либо no-op, либо не тот
+    уровень awareness, и `GetSystemMetrics` всё ещё может отдавать не
+    то, что нужно.
+
+    **`EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ...)` — надёжнее
+    в принципе**: эта функция читает ТЕКУЩИЙ РЕЖИМ ДРАЙВЕРА ДИСПЛЕЯ
+    напрямую (`dmPelsWidth`/`dmPelsHeight`) — она в принципе не проходит
+    через DPI-виртуализацию GetSystemMetrics и не зависит от
+    DPI-awareness вызывающего процесса вообще, именно поэтому теперь
+    основной путь, а не DPI-awareness+GetSystemMetrics (тот остаётся
+    вторым фолбэком на случай, если EnumDisplaySettingsW почему-то
+    недоступна/отказала)."""
     if sys.platform == "win32":
+        try:
+            devmode = _DEVMODEW()
+            devmode.dmSize = ctypes.sizeof(_DEVMODEW)
+            if ctypes.windll.user32.EnumDisplaySettingsW(
+                None, _ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)
+            ):
+                w, h = int(devmode.dmPelsWidth), int(devmode.dmPelsHeight)
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception:
+            pass
         try:
             _ensure_dpi_aware()
             user32 = ctypes.windll.user32
