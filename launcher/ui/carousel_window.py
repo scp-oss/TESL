@@ -220,7 +220,12 @@ class CarouselWindow(QWidget):
         self.strip_layout = QHBoxLayout(self.strip)
         self.strip_layout.setContentsMargins(0, 0, 0, 0)
         self.strip_layout.setSpacing(16)
-        self.strip_layout.addStretch()
+        # Никакого stretch'а здесь — плитки ещё не загружены, добавлять
+        # его сейчас значило бы при первом заполнении (_on_builds_loaded)
+        # либо держать его отдельно от второго (ведущего) stretch, либо
+        # городить индексную арифметику. Оба stretch'а (ведущий + замыкающий,
+        # дают центрирование — см. _on_builds_loaded) добавляются там же,
+        # где и сами плитки, одним проходом.
         scroll.setWidget(self.strip)
         root.addWidget(scroll, 1)
 
@@ -250,14 +255,19 @@ class CarouselWindow(QWidget):
             return
         self.status_label.setText(f"Доступно сборок: {len(builds)}")
 
-        # Убираем финальный stretch, добавляем плитки, возвращаем stretch —
-        # чтобы плитки были прижаты к левому краю при малом количестве.
-        self.strip_layout.takeAt(self.strip_layout.count() - 1)
+        # Stretch и ведущий, и замыкающий — по макету (Carousel.dc.html:
+        # контейнер плиток центрирован, `justify-content: center`), не
+        # прижаты к левому краю, как было раньше (только замыкающий
+        # stretch). При переполнении (плиток больше, чем влезает в
+        # ширину) оба stretch'а сжимаются до 0 и включается обычный
+        # горизонтальный скролл — ничего дополнительно настраивать не
+        # нужно, это стандартное поведение QHBoxLayout+QScrollArea.
+        self.strip_layout.addStretch(1)
         for b in builds:
             tile = BuildTile(b, self._on_tile_clicked, self.strip)
             self._tiles[b.name] = tile
             self.strip_layout.addWidget(tile)
-        self.strip_layout.addStretch()
+        self.strip_layout.addStretch(1)
 
     def _on_poster_loaded(self, build_name: str, data: bytes):
         tile = self._tiles.get(build_name)
