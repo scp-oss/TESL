@@ -1,30 +1,38 @@
 # ==================== launcher/ui/settings_dialog.py ====================
 """
-Диалог настроек — прямой запрос пользователя 2026-09-22 ("на последнем
-скрине раздел настроек давай туда уберем все тулсы не тулсы плюс режим
-дебаг"): инструментальные кнопки (патч/проверка файлов/очистка Skyrim,
-перезапуск Explorer), раньше жившие отдельной колонкой слева в главном
-окне, перенесены сюда — плюс новый переключатель "Режим отладки" (см.
-core/debug_log.py, ui/main_window.py::_set_debug_mode()).
+Диалог настроек — он же "меню сборки", прямой запрос пользователя
+2026-10-06 ("меню сборки и настройки это должно быть одно и то же в
+одном месте"): попытка развести эти две кнопки по разным местам в тот
+же день была откачена — единственная точка входа снова ⚙
+(ui/main_window.py::_open_settings()).
 
-Кнопки patch/revert передаются УЖЕ СОЗДАННЫМИ из main_window.py, не
-создаются здесь — это те же самые self.btn_patch/self.btn_revert, на
-которые ссылается main_window.py::ALL_BTNS/_disable_buttons() для
-блокировки во время параллельных операций (install/verify/patch не
-должны идти одновременно). Переезд в этот диалог меняет только их
-визуального родителя — Qt переставляет parent автоматически при
-addWidget() в layout нового виджета, сама Python-ссылка и вся логика
-enable/disable в main_window.py остаётся рабочей без изменений.
+Состав, тем же запросом, пересобран с нуля: "🔨 Пропатчить Skyrim"/
+"♻️ Очистить Skyrim"/"🔄 Перезапустить Explorer" убраны — больше не
+нужны (их методы в main_window.py — `_revert_skyrim`/`_restart_explorer`
+— удалены целиком; `_patch_skyrim()` остался, но вызывается только из
+FirstRunDialog, не из этого диалога). Вместо них — "▶ Запустить Mod
+Organizer 2" (прямой запуск игры без прохождения через умную кнопку
+статуса в центре окна), "🛠 Проверить файлы" (VerifyWorker, полный
+рескан+сравнение с сервером, функционал не менялся ни на строчку за
+всю историю этого файла — только его UI-расположение) и "📂 Перенести
+в другое место" (MoveInstallWorker — переносит уже установленную
+сборку на диске, не переустанавливая её заново). Плюс переключатель
+"Режим отладки" (см. core/debug_log.py, ui/main_window.py::
+_set_debug_mode()) — единственный пункт, не являющийся кнопкой-
+действием, поэтому остаётся отдельным чекбоксом под разделителем.
 
-**btn_verify переехал ОТСЮДА в «меню сборки» 2026-10-06** (прямой
-запрос пользователя: "кнопку проверить в файлы нужно поместить в меню
-сборки") — см. main_window.py::_open_build_menu(). Сам полный-рескан
-функционал кнопки (VerifyWorker — перечитывает и сравнивает ВСЕ файлы
-с сервером) не изменился ни на строчку, поменялось только то, в каком
-UI-контейнере кнопка физически показывается.
+Кнопки передаются УЖЕ СОЗДАННЫМИ из main_window.py, не создаются
+здесь — это те же самые self.btn_verify/self.btn_launch_mo2/
+self.btn_move_install, на которые ссылается main_window.py::ALL_BTNS/
+_disable_buttons() для блокировки во время параллельных операций
+(install/verify/patch/перенос не должны идти одновременно). Переезд в
+этот диалог меняет только их визуального родителя — Qt переставляет
+parent автоматически при addWidget() в layout нового виджета, сама
+Python-ссылка и вся логика enable/disable в main_window.py остаётся
+рабочей без изменений.
 """
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QDialog, QVBoxLayout, QPushButton, QLabel,
     QCheckBox, QFrame,
 )
 
@@ -34,28 +42,23 @@ class SettingsDialog(QDialog):
     def __init__(
         self,
         parent,
-        btn_patch: QPushButton,
-        btn_revert: QPushButton,
-        restart_explorer_fn,
+        btn_verify: QPushButton,
+        btn_launch_mo2: QPushButton,
+        btn_move_install: QPushButton,
         debug_mode_getter,
         debug_mode_setter,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Настройки")
-        self.resize(360, 340)
+        self.setWindowTitle("Меню сборки / Настройки")
+        self.resize(360, 300)
 
         v = QVBoxLayout(self)
         v.setSpacing(10)
 
-        v.addWidget(QLabel("Инструменты:"))
-        for b in (btn_patch, btn_revert):
+        v.addWidget(QLabel("Сборка:"))
+        for b in (btn_launch_mo2, btn_verify, btn_move_install):
             b.setFixedHeight(36)
             v.addWidget(b)
-
-        self.btn_explorer = QPushButton("🔄 Перезапустить Explorer")
-        self.btn_explorer.setFixedHeight(36)
-        self.btn_explorer.clicked.connect(restart_explorer_fn)
-        v.addWidget(self.btn_explorer)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)

@@ -702,7 +702,8 @@ class ChunkInstaller:
             self.on_log("✅ Все файлы актуальны")
             return True
 
-        self.on_log(f"📦 Требует обновления: {len(to_process)} файлов")
+        to_process_bytes = sum(e.size for e in to_process)
+        self.on_log(f"📦 Требует обновления: {len(to_process)} файлов ({_fmt_size(to_process_bytes)})")
 
         # Планирование: для каждого файла — уникальные chunk_id (дедуп
         # ЗДЕСЬ, один раз, за пределами любого async-кода — remaining[i]/

@@ -9,11 +9,16 @@
 Макет (780×500) — левая колонка "инструментов" (патч/проверка/очистка)
 переехала в диалог настроек (⚙, см. _open_settings()/ui/settings_dialog.py,
 прямой запрос пользователя 2026-09-22). 2026-10-06: "🛠 Проверить файлы"
-переехала ОТТУДА в отдельное "меню сборки" (📦, см. _open_build_menu()) —
-та кнопка относится к текущей сборке, не к лаунчеру в целом, ⚙ остаётся
-только для патча/очистки Skyrim/режима отладки:
+переехала ОТТУДА в отдельное "меню сборки" (📦) — попытка развести их по
+разным кнопкам в тот же день была ОТКАЧЕНА прямым запросом пользователя
+("меню сборки и настройки это должно быть одно и то же в одном месте") —
+⚙ снова единственная точка входа, но содержимое внутри полностью
+пересобрано: "🔨 Пропатчить Skyrim"/"♻️ Очистить Skyrim"/"🔄 Перезапустить
+Explorer" убраны (не нужны), вместо них — "▶ Запустить Mod Organizer 2"/
+"🛠 Проверить файлы"/"📂 Перенести в другое место" + чекбокс "Режим
+отладки", см. _open_settings()/ui/settings_dialog.py:
   ┌─────────────────────────────────────────────────────────────┐
-  │ [📁 папка]  [🏷 ярлык]     Версия: ...     [📦] [⚙] [🌙] │
+  │ [📁 папка]  [🏷 ярлык]          Версия: ...      [⚙] [🌙] │
   ├────────────────────────────────┬──────────────────────────────┤
   │ Center (постер, шире)          │ Right 230px                  │
   │       poster.png               │ Выберите версию:             │
@@ -43,7 +48,7 @@ from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QPixmap, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QProgressBar, QTextEdit, QFileDialog, QFrame, QComboBox,
-    QSizePolicy, QMessageBox, QApplication, QDialog,
+    QSizePolicy, QMessageBox, QApplication,
 )
 
 from config import (
@@ -53,7 +58,7 @@ from config import (
 from core.workers import (
     ThreadSafeWorker, VersionLoaderWorker, DownloadWorker,
     VerifyWorker, PosterLoader, SkyrimCheckWorker, CrashLogSender,
-    PostInstallWorker,
+    PostInstallWorker, MoveInstallWorker,
 )
 from core.patcher import SkyrimPatcher
 from core.depot_client import DepotClient
@@ -148,6 +153,7 @@ class UpdaterUI(QWidget):
         self.is_installing   = False
         self.is_verifying    = False
         self.is_patching     = False
+        self.is_moving       = False           # перенос папки сборки — см. _move_install_location()
         self._worker_paused  = False
         self._is_closing     = False
         self._full_local_path = ""
@@ -183,6 +189,8 @@ class UpdaterUI(QWidget):
         self.crash_thread    = None
         self.postinstall_worker = None
         self.postinstall_thread = None
+        self.move_worker        = None
+        self.move_thread        = None
 
         # ── UI Updater (потокобезопасный) ─────────────────────────────────────
         self.ui_updater = UIUpdater()
@@ -231,25 +239,15 @@ class UpdaterUI(QWidget):
         self.lbl_version = QLabel(self._format_version_label("не установлена"))
         self.lbl_version.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        # "🔄 Перезапустить Explorer" переехал в диалог настроек (см.
-        # _open_settings()/ui/settings_dialog.py) — сама кнопка теперь
-        # создаётся там, _restart_explorer() как метод остался прежним.
+        # Единственная точка входа для всего "не главного" функционала —
+        # прямой запрос пользователя 2026-10-06, тем же днём: отдельная
+        # кнопка "меню сборки" (📦), введённая чуть раньше в этот же день,
+        # ОТКАЧЕНА ("меню сборки и настройки это должно быть одно и то же
+        # в одном месте") — см. _open_settings()/ui/settings_dialog.py.
         self.btn_settings = QPushButton("⚙")
         self.btn_settings.setFixedSize(32, 32)
         self.btn_settings.setToolTip("Настройки")
         self.btn_settings.clicked.connect(self._open_settings)
-
-        # "Меню сборки" — прямой запрос пользователя 2026-10-06: "🛠
-        # Проверить файлы" (полный рескан, сравнение с сервером) переехал
-        # СЮДА из глобального диалога настроек (⚙) — та кнопка логически
-        # относится к ТЕКУЩЕЙ выбранной сборке, не к лаунчеру целиком.
-        # См. _open_build_menu() за то, как это меню построено (простой
-        # QDialog, тот же приём "реродительствуем готовый виджет", что
-        # SettingsDialog уже использует для своих кнопок).
-        self.btn_build_menu = QPushButton("📦")
-        self.btn_build_menu.setFixedSize(32, 32)
-        self.btn_build_menu.setToolTip("Меню сборки")
-        self.btn_build_menu.clicked.connect(self._open_build_menu)
 
         self.btn_theme = QPushButton("🌙")
         self.btn_theme.setFixedSize(32, 32)
@@ -259,7 +257,6 @@ class UpdaterUI(QWidget):
         top.addWidget(self.lbl_shortcut)
         top.addStretch()
         top.addWidget(self.lbl_version)
-        top.addWidget(self.btn_build_menu)
         top.addWidget(self.btn_settings)
         top.addWidget(self.btn_theme)
         main_v.addLayout(top)
@@ -268,21 +265,32 @@ class UpdaterUI(QWidget):
         content = QHBoxLayout()
         content.setSpacing(10)
 
-        # "Инструменты" (патч/проверка файлов/очистка Skyrim) переехали в
-        # диалог настроек (см. _open_settings()/ui/settings_dialog.py) —
-        # прямой запрос пользователя 2026-09-22 ("уберем все тулсы не
-        # тулсы... в настройки"). Кнопки создаются здесь как раньше (нужны
-        # main_window.py::ALL_BTNS/_disable_buttons() для блокировки во
-        # время параллельных операций), просто НЕ добавляются ни в один
-        # layout этого окна — SettingsDialog берёт готовые виджеты и
-        # добавляет их в свой layout (см. её докстринг про реродительство).
-        # Левой колонки с фиксированной шириной больше нет — освободившееся
-        # место отдано постеру/центральной колонке (было 310, стало шире).
-        self.btn_patch  = QPushButton("🔨 Пропатчить Skyrim")
-        self.btn_verify = QPushButton("🛠 Проверить файлы")
-        self.btn_revert = QPushButton("♻️ Очистить Skyrim")
+        # Кнопки диалога настроек (⚙) — прямой запрос пользователя
+        # 2026-09-22, пересмотрено 2026-10-06: "🔨 Пропатчить Skyrim"/
+        # "♻️ Очистить Skyrim"/"🔄 Перезапустить Explorer" убраны из UI
+        # (не нужны) — "♻️ Очистить Skyrim"/"🔄 Перезапустить Explorer"
+        # не используются больше нигде, их методы (`_revert_skyrim`/
+        # `_restart_explorer`) удалены целиком; `_patch_skyrim()` остался
+        # (вызывается из FirstRunDialog.ACTION_PATCH_EXISTING — патчинг
+        # УЖЕ НАЙДЕННОЙ копии Skyrim при первом запуске, отдельная от
+        # этой кнопки логика), поэтому `self.btn_patch` тоже остаётся
+        # сконструированным (нужен как параметр `_start_patcher()`'s
+        # восстановления текста кнопки по завершении и для
+        # ALL_BTNS/_disable_buttons()) — просто больше не добавляется
+        # ни в один видимый layout, тот же приём "создан, но не
+        # отображается", что уже применялся здесь для этих кнопок с
+        # 2026-09-22. Новые кнопки диалога — "▶ Запустить Mod Organizer 2"
+        # (`_launch_game()`, уже существующая логика умной кнопки
+        # статуса, просто доступна и явной кнопкой) и "📂 Перенести в
+        # другое место" (`_move_install_location()`, новое). Кнопки
+        # создаются здесь как раньше, НЕ добавляются ни в один layout
+        # этого окна — SettingsDialog берёт готовые виджеты и добавляет
+        # их в свой layout (см. её докстринг про реродительство).
+        self.btn_patch       = QPushButton("🔨 Пропатчить Skyrim")
+        self.btn_verify      = QPushButton("🛠 Проверить файлы")
+        self.btn_launch_mo2  = QPushButton("▶ Запустить Mod Organizer 2")
+        self.btn_move_install = QPushButton("📂 Перенести в другое место")
         self.settings_dialog = None   # создаётся лениво, один раз — см. _open_settings()
-        self._build_menu = None       # создаётся лениво, один раз — см. _open_build_menu()
 
         # Растяжка слева от центра — без своей левой колонки (190px) центр+
         # правая панель (340+230+10=580) уже не заполняют всю ширину окна
@@ -395,7 +403,8 @@ class UpdaterUI(QWidget):
         self.btn_launch.clicked.connect(self._on_status_button_clicked)
         self.btn_patch.clicked.connect(self._patch_skyrim)
         self.btn_verify.clicked.connect(self._verify_files)
-        self.btn_revert.clicked.connect(self._revert_skyrim)
+        self.btn_launch_mo2.clicked.connect(self._launch_game)
+        self.btn_move_install.clicked.connect(self._move_install_location)
         self.btn_latest.clicked.connect(self._update_to_latest)
         self.btn_update.clicked.connect(self._update_to_selected)
         self.btn_rollback.clicked.connect(self._rollback_to_selected)
@@ -562,11 +571,7 @@ class UpdaterUI(QWidget):
         )
         if not parent:
             return
-        parent_path = Path(parent)
-        if parent_path.name.lower() == _config.BUILD_NAME.lower():
-            folder_path = parent_path
-        else:
-            folder_path = parent_path / _config.BUILD_NAME
+        folder_path = self._resolve_build_subfolder(parent)
         folder_path.mkdir(parents=True, exist_ok=True)
         folder = str(folder_path)
         self._full_local_path = folder
@@ -889,9 +894,6 @@ class UpdaterUI(QWidget):
 
     def _patch_skyrim(self):
         self._start_patcher("run_patch", "finished_signal", self.btn_patch, "🔨 Пропатчить Skyrim", "патчинга")
-
-    def _revert_skyrim(self):
-        self._start_patcher("run_revert", "finished_signal", self.btn_revert, "♻️ Очистить Skyrim", "отката")
 
     def _on_patcher_progress(self, current, total, eta):
         pct = int(current / total * 100) if total else 0
@@ -1305,8 +1307,8 @@ class UpdaterUI(QWidget):
 
     ALL_BTNS = property(lambda self: [
         self.btn_launch, self.btn_patch,
-        self.btn_verify, self.btn_revert, self.btn_latest,
-        self.btn_update, self.btn_rollback,
+        self.btn_verify, self.btn_launch_mo2, self.btn_move_install,
+        self.btn_latest, self.btn_update, self.btn_rollback,
     ])
 
     def _disable_buttons(self, exclude=None):
@@ -1331,69 +1333,123 @@ class UpdaterUI(QWidget):
 
     def _open_settings(self):
         """
-        Открывает диалог настроек (прямой запрос пользователя 2026-09-22) —
-        создаётся ОДИН РАЗ (не при каждом клике): диалог реродительствует
-        уже существующие self.btn_patch/self.btn_verify/self.btn_revert в
-        свой layout, и повторное создание диалога заново реродительствовало
-        бы их снова без вреда, но проще и дешевле просто переиспользовать
-        один и тот же объект — см. SettingsDialog.__init__ докстринг.
+        Открывает единый диалог настроек/меню сборки (⚙) — прямой запрос
+        пользователя 2026-09-22, пересмотрено 2026-10-06 тем же днём:
+        отдельная кнопка "меню сборки" (📦) была сделана и тут же
+        откачена тем же днём ("меню сборки и настройки это должно быть
+        одно и то же в одном месте") — ⚙ снова единственная точка входа.
+        Создаётся ОДИН РАЗ (не при каждом клике): диалог реродительствует
+        уже существующие self.btn_verify/self.btn_launch_mo2/
+        self.btn_move_install в свой layout, и повторное создание
+        диалога заново реродительствовало бы их снова без вреда, но
+        проще и дешевле просто переиспользовать один и тот же объект —
+        см. SettingsDialog.__init__ докстринг.
         """
         if self.settings_dialog is None:
             self.settings_dialog = SettingsDialog(
                 self,
-                self.btn_patch, self.btn_revert,
-                restart_explorer_fn=self._restart_explorer,
+                self.btn_verify, self.btn_launch_mo2, self.btn_move_install,
                 debug_mode_getter=self._get_debug_mode,
                 debug_mode_setter=self._set_debug_mode,
             )
         self.settings_dialog.exec()
 
-    # ── Build menu ────────────────────────────────────────────────────────────
+    # ── Move install location ───────────────────────────────────────────────────
 
-    def _open_build_menu(self):
-        """Меню ТЕКУЩЕЙ сборки (📦) — прямой запрос пользователя
-        2026-10-06: "кнопку проверить в файлы нужно поместить в меню
-        сборки", отдельно от общих настроек лаунчера (⚙). Сейчас
-        единственный пункт — полный рескан ("🛠 Проверить файлы",
-        VerifyWorker, функционал не изменился ни на строчку), но это
-        не одноразовый диалог — задел под будущие per-build пункты
-        (например, открыть папку кеша/сборки) не нужно переделывать
-        с нуля.
+    def _resolve_build_subfolder(self, parent: str) -> Path:
+        """Тот же приём, что и `_choose_folder()`: реальный путь всегда
+        `<parent>/<config.BUILD_NAME>`, кроме случая, когда пользователь
+        САМ выбрал уже так называющуюся папку (сравнение basename без
+        учёта регистра) — тогда используем её напрямую, без двойной
+        вложенности. Общий код для начального выбора папки И для
+        "Перенести в другое место" (2026-10-06) — раньше жил только
+        внутри `_choose_folder()`, теперь вынесен, чтобы не разойтись
+        между двумя местами, которые должны считать путь одинаково."""
+        import config as _config
+        parent_path = Path(parent)
+        if parent_path.name.lower() == _config.BUILD_NAME.lower():
+            return parent_path
+        return parent_path / _config.BUILD_NAME
 
-        **Исправлено 2026-10-06, тем же днём** — первая версия
-        (`QMenu`+`QWidgetAction`, оборачивающий `self.btn_verify`) не
-        показывала кнопку на реальной Windows-машине пользователя,
-        хотя headless (`QT_QPA_PLATFORM=offscreen`)-тест проходил
-        (offscreen не ловит реальные особенности рендеринга
-        попап-окон/стилей на настоящей ОС — тот же класс пробела, что
-        уже отмечался в CLAUDE.md для прежних "не проверено вживую"
-        правок, просто впервые реально пойманный). Заменено на
-        `QDialog` — ТОТ ЖЕ самый, уже проверенный многими прежними
-        сессиями паттерн, что `SettingsDialog` использует для
-        `btn_patch`/`btn_revert` (простой `QVBoxLayout`, кнопка
-        добавлена как обычный child-виджет, не через `QWidgetAction`
-        внутрь попап-меню) — без специфичных для `QMenu` рисков
-        стилизации/геометрии попапов.
+    def _move_install_location(self):
+        """"Перенести в другое место" — прямой запрос пользователя
+        2026-10-06: переместить уже установленную сборку на диске в
+        другую папку (другой диск/путь), не переустанавливая и не
+        перекачивая её заново. Реальный перенос (`shutil.move`, может
+        идти долго на 100+ ГБ, особенно между разными физическими
+        дисками, где это полное копирование+удаление, не атомарный
+        rename) — на фоновом `QThread` (`MoveInstallWorker`,
+        core/workers.py), НЕ на GUI-потоке — тот же класс урока, что уже
+        не раз зафиксирован в CLAUDE.md для синхронной дисковой/сетевой
+        работы прямо в обработчике клика."""
+        if not self._full_local_path or not Path(self._full_local_path).exists():
+            self._append_log("Сначала выберите папку установки")
+            return
+        if self.is_installing or self.is_verifying or self.is_patching or self.is_moving:
+            self._append_log("Сначала дождитесь завершения текущей операции")
+            return
 
-        Строится ОДИН РАЗ (не при каждом клике) — `self.btn_verify`
-        создаётся в `_build_ui()` как обычно (нужен
-        `ALL_BTNS`/`_disable_buttons()` для блокировки во время
-        install/verify/patch), просто никогда не добавлялся в layout
-        главного окна; реродительствуется в layout этого диалога.
-        Click-обработчик/текст кнопки/enable-disable логика в
-        main_window.py не меняются вообще."""
-        if self._build_menu is None:
-            self._build_menu = QDialog(self)
-            self._build_menu.setWindowTitle("Меню сборки")
-            self._build_menu.resize(280, 120)
-            v = QVBoxLayout(self._build_menu)
-            self.btn_verify.setFixedHeight(36)
-            v.addWidget(self.btn_verify)
-            v.addStretch()
-            btn_close = QPushButton("Закрыть")
-            btn_close.clicked.connect(self._build_menu.accept)
-            v.addWidget(btn_close)
-        self._build_menu.exec()
+        import config as _config
+        parent = QFileDialog.getExistingDirectory(
+            self, "Выберите НОВОЕ место для сборки "
+                  f"(будет создана подпапка «{_config.BUILD_NAME}»)",
+            options=QFileDialog.Option.ShowDirsOnly,
+        )
+        if not parent:
+            return
+
+        src = Path(self._full_local_path)
+        dst = self._resolve_build_subfolder(parent)
+        if dst.resolve() == src.resolve():
+            self._append_log("Это то же самое место — переносить нечего")
+            return
+        if dst.exists() and any(dst.iterdir()):
+            QMessageBox.warning(
+                self, "Папка не пуста",
+                f"Папка {dst} уже существует и не пуста — перенос в неё "
+                "отключён, чтобы не перемешать файлы двух сборок.",
+            )
+            return
+
+        # Оценка нужного места — полный проход по дереву (может быть
+        # небыстрым на 170К+ файлах, но один линейный проход, не на
+        # каждый файл отдельно) — лучше предупредить ДО долгого переноса,
+        # чем потом узнать на полпути, что места не хватило.
+        try:
+            src_size = sum(f.stat().st_size for f in src.rglob("*") if f.is_file())
+        except OSError:
+            src_size = None
+        # dst.parent — та же папка, что пользователь выбрал в диалоге
+        # (или её же родитель, если выбрал уже готовую подпапку) —
+        # именно туда реально будет писаться перенесённые данные.
+        check_path = dst.parent if dst.parent.exists() else Path(parent)
+        if src_size and not self._check_disk_space(str(check_path), src_size):
+            return
+
+        self.is_moving = True
+        self._disable_buttons()
+        self.move_worker = MoveInstallWorker(str(src), str(dst))
+        self.move_thread = QThread()
+        self.move_worker.moveToThread(self.move_thread)
+        self.move_worker.log.connect(self._append_log)
+        self.move_worker.finished.connect(self._on_move_finished)
+        self.move_thread.started.connect(self.move_worker.run)
+        self.move_thread.start()
+
+    def _on_move_finished(self, ok: bool, new_path: str):
+        if self.move_thread:
+            self.move_thread.quit()
+            self.move_thread.wait(2000)
+        self.move_worker = None
+        self.move_thread = None
+        self.is_moving = False
+        self._enable_buttons()
+        if ok:
+            self._full_local_path = new_path
+            self.config.setdefault("local_dirs", {})[self._build_key()] = new_path
+            self._save_config()
+            self._update_folder_label()
+            self._refresh_status_button()
 
     def _get_debug_mode(self) -> bool:
         return bool(self.config.get("debug_mode", False))
@@ -1420,26 +1476,6 @@ class UpdaterUI(QWidget):
             return
         username = self.config.get("username", "") or "unknown_user"
         maybe_upload_debug_log(username, reason, log=self._append_log)
-
-    def _restart_explorer(self):
-        if os.name != "nt":
-            return
-        ans = QMessageBox.question(
-            self, "Перезапустить Explorer?",
-            "Это перезапустит explorer.exe. Продолжить?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                 "-Command", "Get-Process explorer | Stop-Process -Force; Start-Process explorer"],
-                check=True, timeout=20,
-            )
-            self._append_log("Explorer перезапущен")
-        except Exception as e:
-            self._append_log(f"Ошибка: {e}")
 
     # ── Bottom bar actions ────────────────────────────────────────────────────
 
@@ -1607,7 +1643,8 @@ class UpdaterUI(QWidget):
                 except Exception:
                     pass
         for attr in ("worker_thread", "verify_thread", "patcher_thread",
-                     "version_thread", "poster_thread", "postinstall_thread"):
+                     "version_thread", "poster_thread", "postinstall_thread",
+                     "move_thread"):
             t = getattr(self, attr, None)
             if t and t.isRunning():
                 t.quit()
