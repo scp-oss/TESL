@@ -518,12 +518,39 @@ class UpdaterUI(QWidget):
     # ── Folder ────────────────────────────────────────────────────────────────
 
     def _choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Выберите папку установки MO2",
+        """Диалог спрашивает РОДИТЕЛЬСКУЮ папку, а не папку установки
+        напрямую — прямой запрос пользователя 2026-10-06 ("указываем
+        место где создаётся папка с именем сборки"): реальный путь
+        установки всегда `<выбранное>/<имя сборки>` (`config.BUILD_NAME`,
+        живое значение — см. `import config as _config` ниже, тот же
+        принцип, что и у остальных мест в этом файле, читающих то, что
+        может поменять `activate_build()` при переключении сборки в
+        карусели). Раньше выбранная папка использовалась буквально как
+        есть — при нескольких сборках в карусели ничто не мешало
+        случайно поставить две разные сборки в одну и ту же папку,
+        перемешав их файлы.
+
+        Если пользователь САМ зашёл внутрь папки, уже называющейся как
+        сборка (например, выбирал её раньше, до этой правки, или просто
+        кликнул на уже существующую `<родитель>/<имя сборки>`) —
+        повторно вкладывать `<имя сборки>` не нужно, сравниваем basename
+        без учёта регистра (Windows сама нечувствительна к регистру для
+        путей)."""
+        import config as _config
+        parent = QFileDialog.getExistingDirectory(
+            self, "Выберите папку, куда установить сборку "
+                  f"(будет создана подпапка «{_config.BUILD_NAME}»)",
             options=QFileDialog.Option.ShowDirsOnly
         )
-        if not folder:
+        if not parent:
             return
+        parent_path = Path(parent)
+        if parent_path.name.lower() == _config.BUILD_NAME.lower():
+            folder_path = parent_path
+        else:
+            folder_path = parent_path / _config.BUILD_NAME
+        folder_path.mkdir(parents=True, exist_ok=True)
+        folder = str(folder_path)
         self._full_local_path = folder
         self.config.setdefault("local_dirs", {})[self._build_key()] = folder
         self._save_config()

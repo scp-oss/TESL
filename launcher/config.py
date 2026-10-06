@@ -21,7 +21,19 @@ LAUNCHER_VERSION = "19.3.0"
 
 # ── Локальные пути (перенесено сюда, наверх — нужны для DAV_PASSWORD_CACHE_FILE
 # ниже, до того как остальной APPDATA_DIR-блок появляется дальше по файлу) ─────
-APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "TESVAE_Launcher"
+# Переименовано из "TESVAE_Launcher" в "TES-Launcher" — прямой запрос
+# пользователя 2026-10-06. Миграция — одноразовое переименование старой
+# папки целиком (на том же томе, APPDATA всегда локальный — дёшево и
+# атомарно на уровне ФС), а не создание новой пустой: иначе каждый, кто
+# уже запускал более раннюю сборку, тихо потерял бы сохранённый
+# config.json/progress.json/пароль WebDAV/кэш постера-манифеста и т.п.
+_OLD_APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "TESVAE_Launcher"
+APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "TES-Launcher"
+if _OLD_APPDATA_DIR.is_dir() and not APPDATA_DIR.exists():
+    try:
+        _OLD_APPDATA_DIR.rename(APPDATA_DIR)
+    except OSError:
+        pass  # занято другим процессом/иной том — не критично, просто стартуем с чистого APPDATA_DIR в этом запуске
 APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Имя текущей сборки — сейчас всегда "TESVAE" (тот же смысл, что и
@@ -397,7 +409,7 @@ def activate_build(build) -> None:
 
 def write_log_file(msg: str) -> None:
     """
-    Дописывает строку в LOG_FILE (%APPDATA%\\TESVAE_Launcher\\launcher.log).
+    Дописывает строку в LOG_FILE (%APPDATA%\\TES-Launcher\\launcher.log).
     Единственное место с этой логикой — раньше жила только внутри
     ui/main_window.py::UpdaterUI._write_log_file() как статический метод;
     вынесена сюда, когда появился второй вызывающий (ui/carousel_window.py,
