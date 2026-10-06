@@ -693,6 +693,19 @@ class UpdaterUI(QWidget):
         v = self._version_meta.get(label) if label else None
         return v.get("total_size") if v else None
 
+    # Живой инцидент 2026-10-06: пользователь упёрся в "No space left on
+    # device" прямо в середине установки (ENOSPC на cache.put() —
+    # сам кэш чанков теперь живёт на ТОМ ЖЕ диске, что и сама сборка,
+    # см. "Кеш чанков переехал..." в CLAUDE.md), хотя размер сборки
+    # формально укладывался в свободное место — проверка ниже сравнивала
+    # free >= size_bytes БЕЗ ЗАПАСА, а кэш чанков (до
+    # cache_bytes_limit=768MB по умолчанию) и файловая система (округление
+    # кластеров на сотнях тысяч мелких файлов) требуют места СВЕРХ
+    # итоговых размеров файлов. Запас — фиксированные 2GB, не доля от
+    # размера сборки (та же проблема повторилась бы и на маленькой
+    # сборке — кэш чанков не масштабируется вместе с размером сборки).
+    _DISK_SPACE_SAFETY_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
+
     def _check_disk_space(self, local_dir: str, size_bytes: "int | None") -> bool:
         """True — можно продолжать установку. Прямой запрос пользователя
         2026-10-06: перед установкой сравнить размер сборки со свободным
@@ -708,13 +721,17 @@ class UpdaterUI(QWidget):
         except OSError as e:
             self._append_log(f"⚠️ Не удалось проверить свободное место на диске: {e}")
             return True
-        if free >= size_bytes:
+        needed = size_bytes + self._DISK_SPACE_SAFETY_MARGIN_BYTES
+        if free >= needed:
             return True
         reply = QMessageBox.warning(
             self, "Недостаточно места на диске",
             f"Размер сборки: {self._fmt_size(size_bytes)}\n"
             f"Свободно на диске: {self._fmt_size(free)}\n\n"
-            "Свободного места может не хватить для завершения установки. "
+            "Рекомендуется иметь на диске запас сверх размера сборки "
+            f"(~{self._fmt_size(self._DISK_SPACE_SAFETY_MARGIN_BYTES)}) под "
+            "временный кэш чанков и файловую систему — иначе установка "
+            "может упереться в «No space left on device» прямо посередине. "
             "Продолжить всё равно?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,

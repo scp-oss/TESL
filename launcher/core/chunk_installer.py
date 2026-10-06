@@ -44,6 +44,7 @@
   из-за неудачной закачки — см. `release()`'s собственный докстринг.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -752,6 +753,16 @@ class ChunkInstaller:
         written_bytes = 0
         ok_files, fail_files = 0, 0
         stats_lock = threading.Lock()
+        # Живой инцидент 2026-10-06: ENOSPC на cache.put() вылетел наружу
+        # необработанным, абортя всю установку через общий except Exception
+        # в DownloadWorker.run() (ui потерял любую детализацию — "Критическая
+        # ошибка" + трейсбек вместо понятного русского сообщения). Флаг,
+        # видимый и главному циклу (ниже), и _assemble() (отдельный пул
+        # потоков) — оба места реально пишут на диск, оба могут первыми
+        # поймать ENOSPC. once set — тот же контролируемый путь остановки,
+        # что и у should_stop() (отмена in_flight, resume_writer.close(),
+        # chunks_dir чистится), просто с другим сообщением в лог.
+        disk_full_event = threading.Event()
         start_t = time.time()
         last_sample_t = start_t
         last_sample_downloaded = 0
@@ -779,6 +790,15 @@ class ChunkInstaller:
         def _assemble(i: int) -> None:
             nonlocal ok_files, fail_files, written_bytes
             e = to_process[i]
+            if disk_full_event.is_set():
+                # Диск уже заполнен (обнаружено либо здесь на другом файле,
+                # либо в главном цикле на cache.put()) — не тратим время на
+                # попытку записи, заведомо обречённую той же ошибкой, для
+                # ЕЩЁ не начатых файлов. Уже начатые — своя ветка ниже.
+                with stats_lock:
+                    fail_files += 1
+                cache.release(file_chunk_ids[i])
+                return
             self._dbg(f"🐛 assemble[{i}] start {e.rel_out_path} chunks={len(e.chunks)} unique={len(file_chunk_ids[i])}")
             out_path = self.local_dir / Path(e.rel_out_path.replace("/", os.sep))
             if os.name == "nt":
@@ -812,6 +832,16 @@ class ChunkInstaller:
                 # причину.
                 self.on_log(f"❌ Ошибка записи {e.rel_out_path}: {type(ex).__name__}: {ex!r}")
                 ok = False
+                if isinstance(ex, OSError) and ex.errno == errno.ENOSPC:
+                    # Диск заполнен — это не "ошибка одного файла", а
+                    # фатальное условие для ВСЕЙ установки (следующий файл
+                    # упрётся в то же самое). Главный цикл ниже проверяет
+                    # этот флаг наравне с should_stop() и останавливает всё
+                    # контролируемо, а не через необработанное исключение,
+                    # пробивающее оба ThreadPoolExecutor'а до общего
+                    # except в DownloadWorker.run() (живой инцидент, см.
+                    # CLAUDE.md).
+                    disk_full_event.set()
 
             if ok and h.hexdigest() != e.file_hash:
                 # Хэш — по записанным байтам, без повторного чтения с
@@ -881,12 +911,21 @@ class ChunkInstaller:
 
             _submit_more()
             while in_flight or next_idx < len(tasks):
-                if self.should_stop():
+                if self.should_stop() or disk_full_event.is_set():
                     for f in in_flight:
                         f.cancel()
                     if self.debug:
                         self._dbg_emit(None, force=True)
-                    self.on_log("⏹ Загрузка остановлена")
+                    if disk_full_event.is_set():
+                        self.on_log(
+                            "❌ Диск заполнен — на устройстве не осталось свободного "
+                            "места. Освободите место (или перенесите сборку на другой "
+                            "диск — ⚙ → «📂 Перенести в другое место») и запустите "
+                            "установку снова — уже скачанные и проверенные файлы "
+                            "не перекачаются заново."
+                        )
+                    else:
+                        self.on_log("⏹ Загрузка остановлена")
                     resume_writer.close()
                     shutil.rmtree(chunks_dir, ignore_errors=True)
                     return False
@@ -920,7 +959,21 @@ class ChunkInstaller:
                                 fail_files += 1
                                 cache.release(file_chunk_ids[i])
                         else:
-                            cache.put(cid, data)
+                            try:
+                                cache.put(cid, data)
+                            except OSError as ex:
+                                if ex.errno == errno.ENOSPC:
+                                    # Диск заполнен прямо на записи кэша
+                                    # чанка — тот же живой инцидент
+                                    # 2026-10-06, см. disk_full_event выше.
+                                    # Этот конкретный чанк не считается ни
+                                    # скачанным, ни обречённым (данные были
+                                    # получены из сети нормально — просто
+                                    # некуда их положить) — главный цикл
+                                    # остановится на следующей итерации.
+                                    disk_full_event.set()
+                                    continue
+                                raise
                             downloaded_bytes += len(data)
                             self._dbg(f"🐛 dl {cid[:12]} OK {len(data)}B")
                             for i in chunk_to_files[cid]:
