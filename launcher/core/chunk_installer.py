@@ -22,6 +22,8 @@
 
 import hashlib
 import os
+import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -274,25 +276,50 @@ def _plan_chunk_order_packed(to_process: List[FileEntry], file_chunk_ids: List[S
 
 
 class _ChunkCache:
-    """Владеет байтами чанков и их refcount'ом за одним lock'ом — вся
-    разделяемая изменяемая память установки в одном месте. `release()`
-    дедупит свой аргумент сама (`set(cids)`), так что вызывающий код не
-    может забыть это сделать — именно забытый дедуп был причиной живого
-    KeyError 2026-09-22 (чанк на двух offset'ах одного файла — release()
-    звали дважды, refcount уходил в минус раньше времени, чанк вытеснялся
-    из кэша, пока другой файл на него ещё ссылался). Второе следствие
-    инкапсуляции: doom-путь (чанк не скачался) и success-путь (файл
-    собрался) теперь зовут ОДИН и тот же `release()` — `put()` для
-    незагрузившегося чанка просто никогда не вызывается, так что
-    `release()` на него — безопасный no-op (pop возвращает None, байтовый
-    счётчик не трогается), а не нужна отдельная ветка "исключить этот
-    cid", как было раньше."""
+    """Владеет чанками (на диске, не в RAM — см. ниже) и их refcount'ом
+    за одним lock'ом — вся разделяемая изменяемая память установки в
+    одном месте. `release()` дедупит свой аргумент сама (`set(cids)`),
+    так что вызывающий код не может забыть это сделать — именно забытый
+    дедуп был причиной живого KeyError 2026-09-22 (чанк на двух
+    offset'ах одного файла — release() звали дважды, refcount уходил в
+    минус раньше времени, чанк вытеснялся из кэша, пока другой файл на
+    него ещё ссылался). Второе следствие инкапсуляции: doom-путь (чанк
+    не скачался) и success-путь (файл собрался) теперь зовут ОДИН и тот
+    же `release()` — `put()` для незагрузившегося чанка просто никогда
+    не вызывается, так что `release()` на него — безопасный no-op (файла
+    на диске нет, байтовый счётчик не трогается), а не нужна отдельная
+    ветка "исключить этот cid", как было раньше.
 
-    def __init__(self, bytes_limit: int, debug_log: Optional[Callable[[str], None]] = None):
+    **Диск, не RAM, с 2026-10-06** — живой инцидент: реальная установка
+    на 134ГБ-сборке держала Python-процесс на 11.7+ ГБ ОЗУ, растущих
+    без остановки, несмотря на номинальный `bytes_limit=768MB`. Прямое
+    предложение пользователя ("сделать папку кеш... выгружается в сыром
+    виде, а потом собирается") — `put()` теперь пишет байты чанка на
+    диск (в отдельную temp-папку, см. `install()`), не держит их в
+    питоновском `dict`; `get_many()` читает их обратно с диска прямо
+    перед сборкой файла. Разница в нагрузке на диск клиента —
+    ничтожная (один write + один read на чанк, в среднем несколько
+    сотен КБ, против самого сетевого скачивания и последующей записи в
+    целевой файл, которые и так уже происходят) — тот же базовый
+    компромисс, что уже многократно применялся на СЕРВЕРНОЙ стороне
+    этого проекта (pack-файлы и т.п.), просто теперь и на клиенте. Это
+    не чинит гипотетическую первопричину того, почему `bytes_limit`
+    раньше не удерживал RAM в разумных пределах (не до конца
+    локализовано статическим анализом) — но делает её неважной: сколько
+    бы чанков ни оказалось одновременно "в работе", в памяти процесса
+    лежат только метаданные (refcount/размер), не сами байты, так что
+    рост RAM в принципе ограничен сверху независимо от этого."""
+
+    def __init__(
+        self, bytes_limit: int, cache_dir: Path,
+        debug_log: Optional[Callable[[str], None]] = None,
+    ):
         self._lock = threading.Lock()
-        self._data: Dict[str, bytes] = {}
+        self._sizes: Dict[str, int] = {}
         self._refcount: Dict[str, int] = {}
         self.bytes_limit = bytes_limit
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._bytes = 0
         # debug_log — построчная трассировка put/release с итоговым
         # refcount'ом, по прямому запросу пользователя 2026-09-30 ("пиши
@@ -303,14 +330,22 @@ class _ChunkCache:
         # ни единой лишней строки/проверки на горячем пути.
         self._debug_log = debug_log
 
+    def _path(self, cid: str) -> Path:
+        return self.cache_dir / cid
+
     def plan(self, cid: str, needed_by: int) -> None:
         """Вызывать для каждого уникального chunk_id ДО старта закачки —
         needed_by = число РАЗНЫХ файлов, которым он нужен."""
         self._refcount[cid] = needed_by
 
     def put(self, cid: str, data: bytes) -> None:
+        # Пишем на диск ВНЕ lock'а (сам I/O не нуждается в синхронизации —
+        # у каждого cid свой файл, разные потоки пишут разные файлы) —
+        # под lock только обновление метаданных, тот же принцип
+        # минимизации времени удержания lock'а, что был и раньше.
+        self._path(cid).write_bytes(data)
         with self._lock:
-            self._data[cid] = data
+            self._sizes[cid] = len(data)
             self._bytes += len(data)
             if self._debug_log:
                 self._debug_log(
@@ -319,19 +354,26 @@ class _ChunkCache:
                 )
 
     def get_many(self, cids: List[str]) -> Optional[List[bytes]]:
-        """bytes для каждого cid по порядку, либо None если хоть один
-        отсутствует (не должно происходить, пока инварианты планирования
-        держатся — отсутствие сигнализирует вызывающему код как ошибку)."""
+        """bytes для каждого cid по порядку (читает с диска), либо None
+        если хоть один отсутствует (не должно происходить, пока
+        инварианты планирования держатся — отсутствие сигнализирует
+        вызывающему код как ошибку). Чтение — тоже вне lock'а (сам файл
+        к этому моменту уже дописан и неизменен, читать его параллельно
+        с чем угодно безопасно; lock нужен только метаданным)."""
+        paths = []
         with self._lock:
-            out = []
             for cid in cids:
-                b = self._data.get(cid)
-                if b is None:
+                if cid not in self._sizes:
                     if self._debug_log:
                         self._debug_log(f"🐛 cache.get_many: {cid[:12]} ОТСУТСТВУЕТ (refcount={self._refcount.get(cid)})")
                     return None
-                out.append(b)
-            return out
+                paths.append(self._path(cid))
+        try:
+            return [p.read_bytes() for p in paths]
+        except OSError as e:
+            if self._debug_log:
+                self._debug_log(f"🐛 cache.get_many: ошибка чтения с диска: {e!r}")
+            return None
 
     def release(self, cids: Iterable[str]) -> None:
         with self._lock:
@@ -340,10 +382,14 @@ class _ChunkCache:
                 new_rc = self._refcount[cid]
                 evicted = False
                 if new_rc <= 0:
-                    b = self._data.pop(cid, None)
-                    if b is not None:
-                        self._bytes -= len(b)
+                    size = self._sizes.pop(cid, None)
+                    if size is not None:
+                        self._bytes -= size
                         evicted = True
+                        try:
+                            self._path(cid).unlink()
+                        except OSError:
+                            pass  # уже удалён/недоступен — не критично, временная папка чистится целиком в конце
                 if self._debug_log:
                     self._debug_log(
                         f"🐛 cache.release {cid[:12]} refcount={new_rc}"
@@ -543,7 +589,16 @@ class ChunkInstaller:
             for cid in unique_ids:
                 chunk_to_files.setdefault(cid, []).append(i)
 
-        cache = _ChunkCache(self.cache_bytes_limit, debug_log=self._dbg_emit if self.debug else None)
+        # Временная папка для "сырых" чанков на диске (см. _ChunkCache's
+        # докстринг за полную картину живого инцидента 2026-10-06) —
+        # системный temp, НЕ self.local_dir: та может быть на медленном/
+        # сетевом пути (как было в реальном случае, P:\...), системный
+        # temp обычно на локальном SSD и явно отделён от самой установки.
+        # Чистится в конце install() (все три выхода из функции ниже) —
+        # ЗДЕСЬ, а не в __init__/__del__ "_ChunkCache", раз именно
+        # install() владеет жизненным циклом этого конкретного прогона.
+        cache_dir = Path(tempfile.mkdtemp(prefix="tesl_chunk_cache_"))
+        cache = _ChunkCache(self.cache_bytes_limit, cache_dir, debug_log=self._dbg_emit if self.debug else None)
         for cid, files in chunk_to_files.items():
             cache.plan(cid, len(files))
             self._dbg(f"🐛 plan {cid[:12]} needed_by={len(files)} files={files}")
@@ -686,6 +741,7 @@ class ChunkInstaller:
                     if self.debug:
                         self._dbg_emit(None, force=True)
                     self.on_log("⏹ Загрузка остановлена")
+                    shutil.rmtree(cache_dir, ignore_errors=True)
                     return False
 
                 if not in_flight:
@@ -786,6 +842,8 @@ class ChunkInstaller:
         removed = self._cleanup_extra_files(entries)
         if removed:
             self.on_log(f"🗑 Удалено лишних файлов: {removed}")
+
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
         if fail_files:
             self.on_log(f"❌ Установка завершена с ошибками: {ok_files} ок, {fail_files} ошибок")
