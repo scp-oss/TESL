@@ -180,6 +180,66 @@ class _ResumeStateWriter:
                 pass
 
 
+def _scan_warm_chunks(chunks_dir: Path, needed_chunks: Set[str], chunk_size: Dict[str, int]) -> Set[str]:
+    """Сканирует `chunks_dir` — может содержать байты чанков, оставшиеся
+    от ПРЕРВАННОГО прошлого прогона install() (краш/ENOSPC/kill -9) —
+    install() раньше безусловно удалял эту папку в начале каждого
+    прогона (`shutil.rmtree`), выбрасывая реально уже скачанные по сети
+    данные впустую. Прямой запрос пользователя 2026-10-06: "добавь
+    чтение кеша не удалённого если он есть чтобы заново не качать".
+
+    Каждый найденный файл — либо ещё нужный в ЭТОМ прогоне чанк (имя
+    файла == chunk_id, он есть в `needed_chunks`), либо мусор (чанк от
+    другой версии/манифеста, которой здесь уже нет) — мусор удаляется
+    сразу, не копится на диске вечно.
+
+    Для нужных — ПРОВЕРКА ЦЕЛОСТНОСТИ без единого похода в сеть: имя
+    файла — это sha256 его содержимого (`chunk_id` content-addressed,
+    тот же факт, на котором `PanelDepotClient.download_chunk()` уже
+    верифицирует сетевые данные), так что достаточно сверить размер и
+    sha256 реального содержимого с ожидаемыми. Несовпадение (типичная
+    причина — файл недописан до конца, ровно та же `OSError(ENOSPC)`,
+    что мог прерваться на `write_bytes()` посреди `cache.put()`, см.
+    "Живой инцидент: OSError No space left on device" в CLAUDE.md) —
+    файл удаляется, чанк будет честно перекачан как обычно; это НЕ
+    "доверие вслепую" частично записанному файлу, та же дисциплина, что
+    уже применена к `resume_state.jsonl` (запись только после реальной
+    проверки, никогда раньше)."""
+    warm: Set[str] = set()
+    if not chunks_dir.exists():
+        return warm
+    try:
+        entries = list(chunks_dir.iterdir())
+    except OSError:
+        return warm
+    for f in entries:
+        try:
+            if not f.is_file():
+                continue
+        except OSError:
+            continue
+        cid = f.name
+        if cid not in needed_chunks:
+            # Не нужен в ЭТОМ прогоне (другая версия/манифест) — мусор,
+            # не переносим его вечно из прогона в прогон.
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            if f.stat().st_size != chunk_size.get(cid):
+                f.unlink()
+                continue
+            if hashlib.sha256(f.read_bytes()).hexdigest() != cid:
+                f.unlink()
+                continue
+        except OSError:
+            continue
+        warm.add(cid)
+    return warm
+
+
 def _reorder_for_disk_locality(chunk_order: List[str], client, max_workers: int) -> List[str]:
     """Живой инцидент 2026-09-30: 134GB сборка "виснет" на скачивании —
     chunk_order по файлам (см. _plan_chunk_order ниже) не связан с
@@ -457,6 +517,24 @@ class _ChunkCache:
                     f"cache_total={self._bytes}B"
                 )
 
+    def adopt_existing(self, cid: str, size: int) -> None:
+        """Регистрирует файл чанка, который УЖЕ лежит на диске (в
+        `cache_dir`, байт-в-байт тем же путём, что строит `_path(cid)`,
+        и уже провалидированный вызывающим кодом по sha256 — см.
+        `_scan_warm_chunks()`) — ничего не пишет, файл уже там. Warm-старт
+        install() после прерванного прошлого прогона (краш/ENOSPC/
+        kill -9): чанк, реально скачанный в прошлый раз, но так и не
+        вошедший в собранный файл, не нужно качать по сети снова —
+        прямой запрос пользователя 2026-10-06."""
+        with self._lock:
+            self._sizes[cid] = size
+            self._bytes += size
+            if self._debug_log:
+                self._debug_log(
+                    f"🐛 cache.adopt_existing {cid[:12]} {size}B (с прошлого прогона) "
+                    f"cache_total={self._bytes}B"
+                )
+
     def get_many(self, cids: List[str]) -> Optional[List[bytes]]:
         """bytes для каждого cid по порядку (читает с диска), либо None
         если хоть один отсутствует (не должно происходить, пока
@@ -681,16 +759,19 @@ class ChunkInstaller:
         # Папка кеша — ВНУТРИ самой сборки (<local_dir>/cache), не
         # системный TEMP: прямой запрос пользователя 2026-10-06 ("желательно
         # не в темп, а в той же папке где находится сборка"). `chunks/`
-        # (сырые байты чанков "в работе", см. _ChunkCache) — чистим с нуля
-        # на каждый install() (ephemeral в пределах одного прогона,
-        # прошлый мусор от прерванного процесса нам не нужен и не
-        # идентифицируем, какому chunk_id какой файл принадлежал бы без
-        # повторного planning()). `resume_state.jsonl` (см. ниже) лежит
-        # РЯДОМ, не внутри — его явно нужно переживать между прогонами,
-        # ради чего всё это и делается.
+        # (сырые байты чанков "в работе", см. _ChunkCache) раньше чистилась
+        # с нуля на КАЖДЫЙ install() — но после живого ENOSPC-инцидента
+        # (см. CLAUDE.md) выяснилось, что это выбрасывает реально уже
+        # скачанные чанки прошлого (прерванного) прогона впустую: прямой
+        # запрос пользователя "добавь чтение кеша не удалённого если он
+        # есть чтобы заново не качать" — больше НЕ чистим слепо здесь,
+        # вместо этого сканируем и переиспользуем валидные файлы ниже
+        # (`_scan_warm_chunks()`, после того как известны needed_chunks/
+        # chunk_size для ЭТОГО прогона). `resume_state.jsonl` (см. ниже)
+        # лежит РЯДОМ, не внутри `chunks/` — его явно нужно переживать
+        # между прогонами, ради чего всё это и делается.
         cache_dir = self.local_dir / "cache"
         chunks_dir = cache_dir / "chunks"
-        shutil.rmtree(chunks_dir, ignore_errors=True)
 
         self.on_log(f"📋 Файлов в chunk-манифесте: {len(entries)}")
         self.on_log("🔍 Сравниваем с локальными файлами...")
@@ -730,26 +811,46 @@ class ChunkInstaller:
         # "Сырые" байты чанков на диске — chunks_dir (см. cache_dir/
         # chunks_dir выше и _ChunkCache's докстринг за полную картину
         # живого инцидента 2026-10-06, который завёл дисковый кэш как
-        # таковой) — ephemeral в пределах ЭТОГО прогона install(),
-        # уже очищена с нуля выше. Чистится в конце install() (все три
-        # выхода из функции ниже) — ЗДЕСЬ, а не в __init__/__del__
-        # "_ChunkCache", раз именно install() владеет жизненным циклом
-        # этого конкретного прогона. `resume_writer` (журнал подтверждённо
-        # собранных файлов, см. _ResumeStateWriter) — отдельный от
-        # chunks_dir файл, persist между прогонами, не чистится.
+        # таковой). Чистится в конце install() (все три выхода из функции
+        # ниже) — ЗДЕСЬ, а не в __init__/__del__ "_ChunkCache", раз именно
+        # install() владеет жизненным циклом этого конкретного прогона.
+        # `resume_writer` (журнал подтверждённо собранных файлов, см.
+        # _ResumeStateWriter) — отдельный от chunks_dir файл, persist
+        # между прогонами, не чистится.
+        needed_chunks: Set[str] = set(chunk_to_files.keys())
+        total_bytes = sum(chunk_size[cid] for cid in needed_chunks)
+
+        # Warm-старт — прямой запрос пользователя 2026-10-06: не качать
+        # заново то, что уже реально лежит на диске с прошлого
+        # (прерванного — краш/ENOSPC/kill -9) прогона. Валидирует каждый
+        # найденный файл по sha256 (имя файла = chunk_id, содержимое
+        # content-addressed — та же проверка, что download_chunk() уже
+        # делает для сетевых данных, только без сети) и удаляет и
+        # невалидные, и более не нужные файлы — см. _scan_warm_chunks().
+        warm_cids = _scan_warm_chunks(chunks_dir, needed_chunks, chunk_size)
+        warm_bytes = sum(chunk_size[cid] for cid in warm_cids)
+        if warm_cids:
+            self.on_log(
+                f"⏩ Уже на диске с прошлого прогона — не скачиваем заново: "
+                f"{len(warm_cids)} чанков ({_fmt_size(warm_bytes)})"
+            )
+
         cache = _ChunkCache(self.cache_bytes_limit, chunks_dir, debug_log=self._dbg_emit if self.debug else None)
         resume_writer = _ResumeStateWriter(cache_dir)
         for cid, files in chunk_to_files.items():
             cache.plan(cid, len(files))
             self._dbg(f"🐛 plan {cid[:12]} needed_by={len(files)} files={files}")
 
-        needed_chunks: Set[str] = set(chunk_to_files.keys())
-        total_bytes = sum(chunk_size[cid] for cid in needed_chunks)
+        for cid in warm_cids:
+            cache.adopt_existing(cid, chunk_size[cid])
+            for i in chunk_to_files[cid]:
+                remaining[i] -= 1
+
         self.on_log(f"📦 Уникальных чанков к загрузке: {len(needed_chunks)} ({_fmt_size(total_bytes)})")
 
         failed_chunk_ids: Set[str] = set()
-        done = 0
-        downloaded_bytes = 0
+        done = len(warm_cids)
+        downloaded_bytes = warm_bytes
         written_bytes = 0
         ok_files, fail_files = 0, 0
         stats_lock = threading.Lock()
@@ -765,11 +866,15 @@ class ChunkInstaller:
         disk_full_event = threading.Event()
         start_t = time.time()
         last_sample_t = start_t
-        last_sample_downloaded = 0
+        # = downloaded_bytes (не 0) — иначе первый же замер скорости (0.5с
+        # ниже) увидел бы разом все warm_bytes как "скачанные за полсекунды"
+        # и показал бы абсурдный мгновенный всплеск скорости.
+        last_sample_downloaded = downloaded_bytes
         last_sample_written = 0
         smoothed_dl_speed = 0.0
         smoothed_wr_speed = 0.0
         self.on_progress_max(len(needed_chunks))
+        self.on_progress(done)  # сразу отражаем warm-чанки в прогресс-баре, не дожидаясь первого реального скачивания
 
         # Сборка — диск+CPU, не сеть, отдельный меньший пул. Потолок 4
         # (не os.cpu_count() без ограничения) — живой случай 2026-09-22:
@@ -878,11 +983,20 @@ class ChunkInstaller:
                 chunk_order = _plan_chunk_order(to_process, file_chunk_ids)
                 chunk_order = _reorder_for_disk_locality(chunk_order, self.client, self.max_workers)
 
+            # warm_cids уже на диске (см. warm-старт выше) — не заказываем
+            # их по сети повторно, независимо от того, какая раскладка
+            # построила chunk_order.
+            if warm_cids:
+                chunk_order = [cid for cid in chunk_order if cid not in warm_cids]
+
             tasks = _group_for_batch(chunk_order, self.client, _BATCH_BYTES, _BATCH_GAP_BYTES)
 
-            # Файлы БЕЗ чанков (size=0, реальные пустые файлы в манифесте)
-            # никогда не станут "ready" обычным путём — remaining[i] уже 0,
-            # декрементировать нечего. Подаём их в assemble_pool сразу.
+            # Файлы БЕЗ чанков (size=0, реальные пустые файлы в манифесте,
+            # ИЛИ полностью закрытые warm-чанками с прошлого прогона —
+            # remaining[i] уже декрементирован warm-старт-циклом выше)
+            # никогда не станут "ready" обычным путём внутри цикла закачки
+            # ниже — remaining[i] уже 0, декрементировать нечего. Подаём
+            # их в assemble_pool сразу.
             for i in range(len(to_process)):
                 if remaining[i] == 0:
                     assemble_pool.submit(_assemble, i)
