@@ -56,7 +56,8 @@ jobs:
         working-directory: launcher
         run: >
           pyinstaller --noconsole --onefile --windowed --icon=icon.ico
-          --add-data "icon.ico;." --name TESL main.py
+          --add-data "icon.ico;." --add-data "assets/ini_profile;assets/ini_profile"
+          --name TESL main.py
 
       - name: Resolve release tag
         id: tag

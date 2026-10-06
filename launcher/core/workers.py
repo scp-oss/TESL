@@ -624,11 +624,18 @@ class PostInstallWorker(ThreadSafeWorker):
         from core.skyrim_checker import SkyrimChecker
         from core.patcher import MO2Configurator
         from core.depot_client import fetch_shortcut_assets
+        from core.ini_profile import apply_ini_profile
 
         try:
             result = SkyrimChecker().check(log=self.log.emit)
             if result.found:
                 MO2Configurator.update_ini(self.local_dir, result.skyrim_dir, log=self.log.emit)
+
+            # Skyrim.ini/SkyrimPrefs.ini (Documents\My Games\...) — не
+            # зависит от того, нашёлся ли Skyrim выше: папка должна быть
+            # готова до первого запуска игры, best-effort (см.
+            # core/ini_profile.py — никогда не роняет post-install).
+            apply_ini_profile(log=self.log.emit)
 
             icon_path, arg = fetch_shortcut_assets(log=self.log.emit)
 
