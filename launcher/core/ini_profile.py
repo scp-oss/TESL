@@ -51,6 +51,11 @@ from typing import Dict, Tuple
 
 import config
 
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 _PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
 
 _ENUM_CURRENT_SETTINGS = -1
@@ -311,10 +316,57 @@ def _detect_resolution() -> Tuple[int, int]:
     return DEFAULT_RESOLUTION
 
 
+_DISPLAY_CLASS_GUID = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+
+def _detect_vram_registry_mb() -> int:
+    """Максимальный `HardwareInformation.qwMemorySize` (QWORD, байты) из
+    реестра среди всех подключённых видеоадаптеров — обходит живой баг
+    WMI/`Win32_VideoController.AdapterRAM`: то поле — 32-битный DWORD,
+    физически не может представить ≥4GB VRAM и либо переполняется, либо
+    молча обрезается драйвером при публикации в WMI. Живой отчёт
+    пользователя: AMD Radeon RX 7700 XT (реально 12GB VRAM) определился
+    как 4095 МБ — ровно эта картина (упёрлись в потолок чуть ниже 4096).
+    `qwMemorySize` — 64-битное поле, этого ограничения не имеет, тот же
+    путь, что используют GPU-Z и аналогичные утилиты. Возвращает 0 при
+    любой проблеме (не Windows, ключа нет, старый драйвер без этого
+    поля) — тогда вызывающий код остаётся на значении от wmic/
+    PowerShell."""
+    if winreg is None:
+        return 0
+    best_mb = 0
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS_GUID) as class_key:
+            i = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(class_key, i)
+                except OSError:
+                    break
+                i += 1
+                if not subkey_name.isdigit():
+                    continue  # "Properties" и другие служебные подключи, не индекс адаптера
+                try:
+                    with winreg.OpenKey(class_key, subkey_name) as sub:
+                        value, _ = winreg.QueryValueEx(sub, "HardwareInformation.qwMemorySize")
+                        mb = int(value) // (1024 * 1024)
+                        if mb > best_mb:
+                            best_mb = mb
+                except OSError:
+                    continue
+    except Exception:
+        return 0
+    return best_mb
+
+
 def _detect_gpu() -> Tuple[str, int]:
     """(имя GPU, VRAM в МБ). Только Windows — `wmic`, с откатом на
     PowerShell `Get-CimInstance`, если wmic отсутствует (deprecated в
-    новых сборках). Любая ошибка → (UNKNOWN_GPU, 0), не бросает наружу."""
+    новых сборках). Любая ошибка → (UNKNOWN_GPU, 0), не бросает наружу.
+    VRAM дополнительно сверяется с `_detect_vram_registry_mb()` — если
+    реестр отдаёт БОЛЬШЕЕ значение, используется оно (см. его докстринг
+    про 32-битный потолок `AdapterRAM`); если реестр недоступен/меньше —
+    остаётся значение от wmic/PowerShell, регрессии для карт <4GB нет."""
     if sys.platform != "win32":
         return UNKNOWN_GPU, 0
 
@@ -357,6 +409,10 @@ def _detect_gpu() -> Tuple[str, int]:
                     name, vram_mb = item.get("Name") or UNKNOWN_GPU, ram // (1024 * 1024)
         except Exception:
             return UNKNOWN_GPU, 0
+
+    reg_vram_mb = _detect_vram_registry_mb()
+    if reg_vram_mb > vram_mb:
+        vram_mb = reg_vram_mb
 
     return name or UNKNOWN_GPU, vram_mb
 
