@@ -201,9 +201,28 @@ def get_skyrim_documents_dir() -> Path:
     return Path.home() / "Documents" / "My Games" / "Skyrim Special Edition"
 
 
+def _ensure_dpi_aware() -> None:
+    """Без этого `GetSystemMetrics` честно ЛЖЁТ про реальное разрешение —
+    для DPI-неосведомлённого процесса Windows отдаёт МАСШТАБИРОВАННЫЕ под
+    текущий DPI значения, не настоящие физические пиксели (пример: честные
+    3840x2160 при масштабе экрана 150% превращаются в 2560x1440). Прямой
+    отчёт пользователя: "разрешение не моё" — именно этот класс искажения.
+    Безопасно звать повторно — если DPI-awareness уже выставлен (например,
+    самим PyQt6/Qt до создания этого окна), повторный вызов просто падает
+    с `OSError` (`E_ACCESSDENIED`), тихо проглатывается."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def _detect_resolution() -> Tuple[int, int]:
     if sys.platform == "win32":
         try:
+            _ensure_dpi_aware()
             user32 = ctypes.windll.user32
             w = user32.GetSystemMetrics(0)
             h = user32.GetSystemMetrics(1)
