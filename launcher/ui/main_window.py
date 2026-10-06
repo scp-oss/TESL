@@ -43,7 +43,7 @@ from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QPixmap, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QProgressBar, QTextEdit, QFileDialog, QFrame, QComboBox,
-    QSizePolicy, QMessageBox, QApplication, QMenu, QWidgetAction,
+    QSizePolicy, QMessageBox, QApplication, QDialog,
 )
 
 from config import (
@@ -243,10 +243,9 @@ class UpdaterUI(QWidget):
         # Проверить файлы" (полный рескан, сравнение с сервером) переехал
         # СЮДА из глобального диалога настроек (⚙) — та кнопка логически
         # относится к ТЕКУЩЕЙ выбранной сборке, не к лаунчеру целиком.
-        # См. _open_build_menu() за то, как это всплывающее меню
-        # построено (QWidgetAction оборачивает уже существующий
-        # self.btn_verify — тот же приём "реродительствуем готовый
-        # виджет", что SettingsDialog уже использует для своих кнопок).
+        # См. _open_build_menu() за то, как это меню построено (простой
+        # QDialog, тот же приём "реродительствуем готовый виджет", что
+        # SettingsDialog уже использует для своих кнопок).
         self.btn_build_menu = QPushButton("📦")
         self.btn_build_menu.setFixedSize(32, 32)
         self.btn_build_menu.setToolTip("Меню сборки")
@@ -1352,32 +1351,49 @@ class UpdaterUI(QWidget):
     # ── Build menu ────────────────────────────────────────────────────────────
 
     def _open_build_menu(self):
-        """Всплывающее меню ТЕКУЩЕЙ сборки (📦) — прямой запрос
-        пользователя 2026-10-06: "кнопку проверить в файлы нужно
-        поместить в меню сборки", отдельно от общих настроек лаунчера
-        (⚙). Сейчас единственный пункт — полный рескан ("🛠 Проверить
-        файлы", VerifyWorker, функционал не изменился ни на строчку),
-        но меню — не одноразовый диалог, задел под будущие per-build
-        пункты (например, открыть папку кеша/сборки) не нужно
-        переделывать с нуля.
+        """Меню ТЕКУЩЕЙ сборки (📦) — прямой запрос пользователя
+        2026-10-06: "кнопку проверить в файлы нужно поместить в меню
+        сборки", отдельно от общих настроек лаунчера (⚙). Сейчас
+        единственный пункт — полный рескан ("🛠 Проверить файлы",
+        VerifyWorker, функционал не изменился ни на строчку), но это
+        не одноразовый диалог — задел под будущие per-build пункты
+        (например, открыть папку кеша/сборки) не нужно переделывать
+        с нуля.
 
-        Строится ОДИН РАЗ (не при каждом клике), тот же принцип
-        ленивого создания с реродительством готового виджета, что уже
-        применяет SettingsDialog для btn_patch/btn_revert —
-        self.btn_verify создаётся в _build_ui() как обычно (нужен
-        ALL_BTNS/_disable_buttons() для блокировки во время
+        **Исправлено 2026-10-06, тем же днём** — первая версия
+        (`QMenu`+`QWidgetAction`, оборачивающий `self.btn_verify`) не
+        показывала кнопку на реальной Windows-машине пользователя,
+        хотя headless (`QT_QPA_PLATFORM=offscreen`)-тест проходил
+        (offscreen не ловит реальные особенности рендеринга
+        попап-окон/стилей на настоящей ОС — тот же класс пробела, что
+        уже отмечался в CLAUDE.md для прежних "не проверено вживую"
+        правок, просто впервые реально пойманный). Заменено на
+        `QDialog` — ТОТ ЖЕ самый, уже проверенный многими прежними
+        сессиями паттерн, что `SettingsDialog` использует для
+        `btn_patch`/`btn_revert` (простой `QVBoxLayout`, кнопка
+        добавлена как обычный child-виджет, не через `QWidgetAction`
+        внутрь попап-меню) — без специфичных для `QMenu` рисков
+        стилизации/геометрии попапов.
+
+        Строится ОДИН РАЗ (не при каждом клике) — `self.btn_verify`
+        создаётся в `_build_ui()` как обычно (нужен
+        `ALL_BTNS`/`_disable_buttons()` для блокировки во время
         install/verify/patch), просто никогда не добавлялся в layout
-        главного окна; QWidgetAction.setDefaultWidget() вставляет его
-        как есть внутрь QMenu — click-обработчик/текст кнопки/
-        enable-disable логика в main_window.py не меняются вообще."""
+        главного окна; реродительствуется в layout этого диалога.
+        Click-обработчик/текст кнопки/enable-disable логика в
+        main_window.py не меняются вообще."""
         if self._build_menu is None:
-            self._build_menu = QMenu(self)
-            action = QWidgetAction(self._build_menu)
-            self.btn_verify.setFixedHeight(32)
-            action.setDefaultWidget(self.btn_verify)
-            self._build_menu.addAction(action)
-        self._build_menu.exec(self.btn_build_menu.mapToGlobal(
-            self.btn_build_menu.rect().bottomLeft()))
+            self._build_menu = QDialog(self)
+            self._build_menu.setWindowTitle("Меню сборки")
+            self._build_menu.resize(280, 120)
+            v = QVBoxLayout(self._build_menu)
+            self.btn_verify.setFixedHeight(36)
+            v.addWidget(self.btn_verify)
+            v.addStretch()
+            btn_close = QPushButton("Закрыть")
+            btn_close.clicked.connect(self._build_menu.accept)
+            v.addWidget(btn_close)
+        self._build_menu.exec()
 
     def _get_debug_mode(self) -> bool:
         return bool(self.config.get("debug_mode", False))
