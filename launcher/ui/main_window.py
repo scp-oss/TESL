@@ -62,7 +62,7 @@ from config import (
 from core.workers import (
     ThreadSafeWorker, VersionLoaderWorker, DownloadWorker,
     VerifyWorker, PosterLoader, SkyrimCheckWorker, CrashLogSender,
-    PostInstallWorker, MoveInstallWorker,
+    PostInstallWorker, MoveInstallWorker, ApplyIniProfileWorker,
 )
 from core.patcher import SkyrimPatcher
 from core.depot_client import DepotClient
@@ -247,6 +247,8 @@ class UpdaterUI(QWidget):
         self.postinstall_thread = None
         self.move_worker        = None
         self.move_thread        = None
+        self.ini_profile_worker = None
+        self.ini_profile_thread = None
 
         # ── UI Updater (потокобезопасный) ─────────────────────────────────────
         self.ui_updater = UIUpdater()
@@ -368,6 +370,13 @@ class UpdaterUI(QWidget):
         self.btn_launch_mo2  = QPushButton("▶ Запустить Mod Organizer 2")
         self.btn_move_install = QPushButton("📂 Перенести в другое место")
         self.btn_create_shortcut = QPushButton("🏷 Создать ярлык")
+        # "🖴 Применить профиль Skyrim.ini" — прямой запрос 2026-10-06:
+        # apply_ini_profile() (core/ini_profile.py) до этого вызывалась
+        # ТОЛЬКО изнутри post-install (установка/"Создать ярлык") — не
+        # было способа прогнать её по требованию, когда пользователь сам
+        # удалил свои Skyrim.ini/SkyrimPrefs.ini, чтобы проверить новые
+        # шаблоны, и ждал, что что-то их пересоздаст.
+        self.btn_apply_ini = QPushButton("🖴 Применить профиль Skyrim.ini")
         self.settings_dialog = None   # создаётся лениво, один раз — см. _open_settings()
 
         # ── Тело окна ─────────────────────────────────────────────────────────
@@ -504,6 +513,7 @@ class UpdaterUI(QWidget):
         self.btn_launch_mo2.clicked.connect(self._open_mo2)
         self.btn_move_install.clicked.connect(self._move_install_location)
         self.btn_create_shortcut.clicked.connect(self._create_shortcut)
+        self.btn_apply_ini.clicked.connect(self._apply_ini_profile)
         self.btn_latest.clicked.connect(self._update_to_latest)
         self.btn_update.clicked.connect(self._update_to_selected)
         self.btn_rollback.clicked.connect(self._rollback_to_selected)
@@ -1486,6 +1496,31 @@ class UpdaterUI(QWidget):
             return
         self._start_post_install_worker(self._full_local_path)
 
+    def _apply_ini_profile(self):
+        """"🖴 Применить профиль Skyrim.ini" — прогоняет `apply_ini_profile()`
+        по требованию (детект GPU/разрешения → рендер шаблонов → запись в
+        `Documents\\My Games\\Skyrim Special Edition`, создавая папку при
+        необходимости), не дожидаясь следующей установки/обновления —
+        см. core/ini_profile.py и core/workers.py::ApplyIniProfileWorker.
+        Независима от `_full_local_path` (целевая папка — путь ОС, не
+        путь MO2) — не требует выбранной папки сборки."""
+        if self.ini_profile_worker is not None:
+            return
+        self.ini_profile_worker = ApplyIniProfileWorker()
+        self.ini_profile_thread = QThread()
+        self.ini_profile_worker.moveToThread(self.ini_profile_thread)
+        self.ini_profile_worker.log.connect(self._append_log)
+        self.ini_profile_worker.finished.connect(self._on_ini_profile_finished)
+        self.ini_profile_thread.started.connect(self.ini_profile_worker.run)
+        self.ini_profile_thread.start()
+
+    def _on_ini_profile_finished(self, ok: bool, msg: str):
+        if self.ini_profile_thread:
+            self.ini_profile_thread.quit()
+            self.ini_profile_thread.wait(2000)
+        self.ini_profile_worker = None
+        self.ini_profile_thread = None
+
     # ── Settings dialog ───────────────────────────────────────────────────────
 
     def _open_settings(self):
@@ -1506,7 +1541,7 @@ class UpdaterUI(QWidget):
             self.settings_dialog = SettingsDialog(
                 self,
                 self.btn_verify, self.btn_launch_mo2, self.btn_move_install,
-                self.btn_create_shortcut,
+                self.btn_create_shortcut, self.btn_apply_ini,
                 debug_mode_getter=self._get_debug_mode,
                 debug_mode_setter=self._set_debug_mode,
             )
@@ -1876,7 +1911,7 @@ class UpdaterUI(QWidget):
                     pass
         for attr in ("worker_thread", "verify_thread", "patcher_thread",
                      "version_thread", "poster_thread", "postinstall_thread",
-                     "move_thread"):
+                     "move_thread", "ini_profile_thread"):
             t = getattr(self, attr, None)
             if t and t.isRunning():
                 t.quit()

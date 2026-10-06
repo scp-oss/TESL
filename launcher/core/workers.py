@@ -593,6 +593,32 @@ class CrashLogSender(ThreadSafeWorker):
             self.finished.emit(False, str(e))
 
 
+# ── Manual ini profile apply ────────────────────────────────────────────────────
+
+class ApplyIniProfileWorker(ThreadSafeWorker):
+    """Явная кнопка "Применить профиль Skyrim.ini" — прямой запрос
+    пользователя 2026-10-06: он удалил свои Skyrim.ini/SkyrimPrefs.ini
+    руками, чтобы проверить новые шаблоны (см. core/ini_profile.py), и
+    они не появились — `apply_ini_profile()` до этого вызывалась ТОЛЬКО
+    изнутри `PostInstallWorker` (после установки/через "Создать ярлык"),
+    без отдельного способа прогнать её по требованию. Этот воркер —
+    тонкая обёртка, ничего больше не делает (не трогает SkyrimChecker/
+    MO2Configurator/ярлык — та логика осталась в PostInstallWorker,
+    смешивать их в одной кнопке только путало бы намерение клика)."""
+    log      = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def run(self):
+        from core.ini_profile import apply_ini_profile
+        try:
+            ok = apply_ini_profile(log=self.log.emit)
+            self.finished.emit(ok, "Профиль применён" if ok else "Не удалось применить профиль")
+        except Exception as e:
+            import traceback
+            self.log.emit(f"❌ Ошибка применения профиля Skyrim.ini: {e}\n{traceback.format_exc()}")
+            self.finished.emit(False, str(e))
+
+
 # ── Post-install configurator ───────────────────────────────────────────────────
 
 class PostInstallWorker(ThreadSafeWorker):

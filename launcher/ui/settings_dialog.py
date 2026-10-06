@@ -38,6 +38,14 @@ Python-ссылка и вся логика enable/disable в main_window.py ос
 же, как раньше это делала отдельная кнопка "Закрыть" (closeEvent
 QDialog по умолчанию вызывает reject(), который этот цикл и завершает)
 — отдельная кнопка "Закрыть" внизу поэтому убрана как дублирующая.
+
+**2026-10-06, позже тем же днём** — добавлена "🖴 Применить профиль
+Skyrim.ini" (`btn_apply_ini` → `ApplyIniProfileWorker`, см.
+core/ini_profile.py/core/workers.py) — прямой запрос: пользователь
+удалил свои Skyrim.ini/SkyrimPrefs.ini, чтобы проверить новые шаблоны,
+но до этого `apply_ini_profile()` вызывалась только изнутри post-install
+(установка/"Создать ярлык") — не было способа прогнать её отдельно, по
+требованию.
 """
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCursor
@@ -57,6 +65,7 @@ class SettingsDialog(QDialog):
         btn_launch_mo2: QPushButton,
         btn_move_install: QPushButton,
         btn_create_shortcut: QPushButton,
+        btn_apply_ini: QPushButton,
         debug_mode_getter,
         debug_mode_setter,
     ):
@@ -81,7 +90,7 @@ class SettingsDialog(QDialog):
         lbl_section.setObjectName("TeslFieldLabel")
         body.addWidget(lbl_section)
 
-        for b in (btn_launch_mo2, btn_verify, btn_move_install, btn_create_shortcut):
+        for b in (btn_launch_mo2, btn_verify, btn_move_install, btn_create_shortcut, btn_apply_ini):
             b.setObjectName("TeslGhostBtn")
             b.setFixedHeight(38)
             b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
