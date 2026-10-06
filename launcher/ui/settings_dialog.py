@@ -56,6 +56,7 @@ class SettingsDialog(QDialog):
         btn_verify: QPushButton,
         btn_launch_mo2: QPushButton,
         btn_move_install: QPushButton,
+        btn_create_shortcut: QPushButton,
         debug_mode_getter,
         debug_mode_setter,
     ):
@@ -80,7 +81,7 @@ class SettingsDialog(QDialog):
         lbl_section.setObjectName("TeslFieldLabel")
         body.addWidget(lbl_section)
 
-        for b in (btn_launch_mo2, btn_verify, btn_move_install):
+        for b in (btn_launch_mo2, btn_verify, btn_move_install, btn_create_shortcut):
             b.setObjectName("TeslGhostBtn")
             b.setFixedHeight(38)
             b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))

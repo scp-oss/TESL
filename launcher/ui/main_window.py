@@ -6,32 +6,36 @@
 выбора сборки (карусель плиток). Это окно открывается ПОСЛЕ выбора плитки,
 уже для конкретной сборки (config.activate_build(), см. main.py).
 
-Макет (780×500) — левая колонка "инструментов" (патч/проверка/очистка)
-переехала в диалог настроек (⚙, см. _open_settings()/ui/settings_dialog.py,
-прямой запрос пользователя 2026-09-22). 2026-10-06: "🛠 Проверить файлы"
-переехала ОТТУДА в отдельное "меню сборки" (📦) — попытка развести их по
-разным кнопкам в тот же день была ОТКАЧЕНА прямым запросом пользователя
-("меню сборки и настройки это должно быть одно и то же в одном месте") —
-⚙ снова единственная точка входа, но содержимое внутри полностью
-пересобрано: "🔨 Пропатчить Skyrim"/"♻️ Очистить Skyrim"/"🔄 Перезапустить
-Explorer" убраны (не нужны), вместо них — "▶ Запустить Mod Organizer 2"/
+2026-10-06: переведено на "стеклянную" оболочку макета (безрамочное окно +
+карточка + кастомный тайтлбар, см. ui/theme.py) — 1040×700, была плоская
+780×500 раскладка с системной рамкой. Та же сессия, раньше в тот же день:
+содержимое диалога настроек (⚙, см. _open_settings()/ui/settings_dialog.py)
+пересобрано — "🔨 Пропатчить Skyrim"/"♻️ Очистить Skyrim"/"🔄 Перезапустить
+Explorer" убраны (не нужны), появились "▶ Запустить Mod Organizer 2"/
 "🛠 Проверить файлы"/"📂 Перенести в другое место" + чекбокс "Режим
-отладки", см. _open_settings()/ui/settings_dialog.py:
+отладки"; ПОЗЖЕ тем же днём туда же переехала "🏷 Создать ярлык" (была
+чипом в тайтлбаре рядом с папкой) — весь функционал "сборки", не
+привязанный к главной CTA-кнопке, теперь в одном месте. "▶ Запустить Mod
+Organizer 2" открывает САМ MO2 без ключей (_open_mo2()) — не то же самое,
+что умная кнопка статуса ниже, которая сразу запускает игру через
+SKSE-ярлык (_launch_game()), оба метода делят общий _resolve_mo2_exe()/
+_spawn_mo2().
+
   ┌─────────────────────────────────────────────────────────────┐
-  │ [📁 папка]  [🏷 ярлык]          Версия: ...      [⚙] [🌙] │
+  │ T  TESL            [📁 папка]              [⚙] [🌙] [–][×] │  TitleBar
   ├────────────────────────────────┬──────────────────────────────┤
-  │ Center (постер, шире)          │ Right 230px                  │
-  │       poster.png               │ Выберите версию:             │
+  │ Left (постер 266×380)          │ Right (flex)                  │
+  │       poster                   │ Выберите версию:             │
   │                                 │ [combo]                      │
   │ [▶ / 📥 / ⬆ / ⏹  TESVAE]      │ [Последняя]                  │
-  │  (умная кнопка статуса)        │ [Обновить]                   │
-  │                                 │ [Откат]                      │
+  │  (умная кнопка статуса, CTA)   │ [Обновить]                   │
+  │ [прогресс-бар] [Пауза]         │ [Откат]                      │
+  │                                 │ Информация о версии:         │
+  │                                 │ [glass text]                 │
   ├─────────────────────────────────┴──────────────────────────────┤
-  │ [████████████████████████████████████] Пауза                 │
+  │ [лог, отдельная панель]                                       │
   ├─────────────────────────────────────────────────────────────┤
-  │ [лог]                             Информация о версии        │
-  ├─────────────────────────────────────────────────────────────┤
-  │ Отправить репорт    ❤ Поддержать    Показать лог            │
+  │ Отправить репорт  ❤ Поддержать    Показать лог   версия/hash │
   └─────────────────────────────────────────────────────────────┘
 """
 import json
@@ -82,14 +86,31 @@ DONATE_URL = "https://www.donationalerts.com/"   # замени на свой
 
 class PosterWidget(QLabel):
     """Постер сборки, размер/скругление — по макету (Main.dc.html: 266×380,
-    radius 20px). QSS border-radius на QLabel НЕ обрезает pixmap, который
-    на него ставят (Qt рисует фон со скруглением, но сам setPixmap() поверх
-    без клипа) — та же ловушка, из-за которой BuildTile в карусели держит
-    постер внутри card с отступом, чтобы прямые углы картинки прятались под
-    padding'ом. Здесь постер — не внутри отдельной карточки (как в макете:
-    изображение заполняет скруглённый контейнер вплотную, без отступа) —
-    вместо этого paintEvent() сам клипит ВСЁ рисование (фон/текст/pixmap)
-    по QPainterPath скруглённого прямоугольника."""
+    radius 20px). QSS border-radius на QLabel рисует ФОН/рамку скруглённо
+    (нормально работает для текстовой заглушки "Загрузка постера..." —
+    Qt включает WA_StyledBackground автоматически, как только у виджета
+    задан непустой stylesheet), но НЕ обрезает pixmap, который на него
+    ставят (setPixmap() рисуется поверх без клипа).
+
+    **Живой баг 2026-10-06, найден по жалобе пользователя** ("у постера
+    видно углы рамки под постер"): первая версия этого класса пыталась
+    клипить через собственный paintEvent() — создавала СВОЙ QPainter(self),
+    выставляла ему clip-путь и затем звала super().paintEvent(event). Это
+    не работает: базовая реализация QLabel.paintEvent() создаёт СВОЙ
+    СОБСТВЕННЫЙ QPainter на том же виджете — два живых QPainter на одном
+    paint device одновременно не поддерживаются Qt, и клип первого
+    (внешнего) painter'а никак не передаётся второму (внутреннему) — pixmap
+    рисовался вообще без обрезки, ровно симптом, который описал
+    пользователь. Пока постер не получал реальный pixmap (только текстовая
+    заглушка на QSS-фоне), баг был не виден — поэтому headless-скриншоты
+    в процессе разработки выглядели корректно, а вживую, с реальным
+    постером/автосгенерированной заглушкой, углы вылезали.
+
+    **Исправлено**: вместо клипа в paintEvent — скругляется САМ pixmap
+    (`_rounded_pixmap()`) перед setPixmap(), той же техникой, что
+    `core/poster_fallback.py` уже использует для автогенерации постеров
+    карусели — один QPainter на СВЕЖИЙ QPixmap, не на виджет, никакого
+    конфликта с внутренней отрисовкой QLabel."""
 
     W, H = 266, 380
     RADIUS = 20
@@ -100,17 +121,23 @@ class PosterWidget(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet(
             f"background: #1a1a1e; color: {qrgba(255,255,255,0.45)}; "
-            f"border: 1px solid {qrgba(255,255,255,0.09)}; font-size: 10pt;"
+            f"border: 1px solid {qrgba(255,255,255,0.09)}; border-radius: {self.RADIUS}px; "
+            f"font-size: 10pt;"
         )
         self.setText("Загрузка постера...")
 
-    def paintEvent(self, event):
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()), self.RADIUS, self.RADIUS)
-        painter = QPainter(self)
+    @staticmethod
+    def _rounded_pixmap(px: QPixmap, radius: int) -> QPixmap:
+        rounded = QPixmap(px.size())
+        rounded.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(rounded)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rounded.rect()), radius, radius)
         painter.setClipPath(path)
-        super().paintEvent(event)
+        painter.drawPixmap(0, 0, px)
+        painter.end()
+        return rounded
 
     def set_image(self, data: bytes):
         try:
@@ -131,7 +158,7 @@ class PosterWidget(QLabel):
             x = (scaled.width()  - self.W) // 2
             y = (scaled.height() - self.H) // 2
             cropped = scaled.copy(x, y, self.W, self.H)
-            self.setPixmap(cropped)
+            self.setPixmap(self._rounded_pixmap(cropped, self.RADIUS))
             self.setText("")
         except Exception:
             self.setText("Постер недоступен")
@@ -147,7 +174,8 @@ class PosterWidget(QLabel):
         активируется config.activate_build() уже ПОСЛЕ импорта модуля."""
         import config as _config
         from core.poster_fallback import render_fallback_poster
-        self.setPixmap(render_fallback_poster(_config.BUILD_NAME, self.W, self.H))
+        px = render_fallback_poster(_config.BUILD_NAME, self.W, self.H)
+        self.setPixmap(self._rounded_pixmap(px, self.RADIUS))
 
 
 # ── UIUpdater ─────────────────────────────────────────────────────────────────
@@ -280,15 +308,14 @@ class UpdaterUI(QWidget):
         title_bar = TitleBar()
         card_v.addWidget(title_bar)
 
-        # ── Доп. виджеты тайтлбара (папка/ярлык/настройки/тема) ─────────────
+        # ── Доп. виджеты тайтлбара (папка/настройки/тема) ───────────────────
+        # "🏷 Ярлык" здесь раньше тоже был (чип рядом с папкой) — прямой
+        # запрос пользователя 2026-10-06: переехал в меню настроек, см.
+        # self.btn_create_shortcut ниже, та же логика (_create_shortcut()).
         self.lbl_folder = QLabel("📁 Выбрать папку")
         self.lbl_folder.setObjectName("TeslChip")
         self.lbl_folder.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.lbl_folder.setMaximumWidth(280)
-
-        self.lbl_shortcut = QLabel("🏷 Ярлык")
-        self.lbl_shortcut.setObjectName("TeslChip")
-        self.lbl_shortcut.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
         # Единственная точка входа для всего "не главного" функционала —
         # прямой запрос пользователя 2026-10-06, тем же днём: отдельная
@@ -308,7 +335,7 @@ class UpdaterUI(QWidget):
         self.btn_theme.setStyleSheet(circle_btn_qss())
         self.btn_theme.clicked.connect(self._toggle_theme)
 
-        for w in (self.lbl_folder, self.lbl_shortcut, self.btn_settings, self.btn_theme):
+        for w in (self.lbl_folder, self.btn_settings, self.btn_theme):
             title_bar.extra_layout.addWidget(w)
 
         # Кнопки диалога настроек (⚙) — прямой запрос пользователя
@@ -325,17 +352,22 @@ class UpdaterUI(QWidget):
         # ALL_BTNS/_disable_buttons()) — просто больше не добавляется
         # ни в один видимый layout, тот же приём "создан, но не
         # отображается", что уже применялся здесь для этих кнопок с
-        # 2026-09-22. Новые кнопки диалога — "▶ Запустить Mod Organizer 2"
-        # (`_launch_game()`, уже существующая логика умной кнопки
-        # статуса, просто доступна и явной кнопкой) и "📂 Перенести в
-        # другое место" (`_move_install_location()`, новое). Кнопки
-        # создаются здесь как раньше, НЕ добавляются ни в один layout
-        # этого окна — SettingsDialog берёт готовые виджеты и добавляет
-        # их в свой layout (см. её докстринг про реродительство).
+        # 2026-09-22. "▶ Запустить Mod Organizer 2" — ОТКРЫВАЕТ сам MO2,
+        # без ключей запуска игры (`_open_mo2()`, прямой запрос
+        # пользователя 2026-10-06 — раньше по ошибке вызывал ту же
+        # _launch_game(), что и умная кнопка статуса, то есть сразу
+        # запускал игру через SKSE-ярлык, а не просто открывал MO2).
+        # "📂 Перенести в другое место" (`_move_install_location()`).
+        # "🏷 Создать ярлык" (`_create_shortcut()`) переехал сюда из
+        # тайтлбара тем же запросом. Кнопки создаются здесь как раньше,
+        # НЕ добавляются ни в один layout этого окна — SettingsDialog
+        # берёт готовые виджеты и добавляет их в свой layout (см. её
+        # докстринг про реродительство).
         self.btn_patch       = QPushButton("🔨 Пропатчить Skyrim")
         self.btn_verify      = QPushButton("🛠 Проверить файлы")
         self.btn_launch_mo2  = QPushButton("▶ Запустить Mod Organizer 2")
         self.btn_move_install = QPushButton("📂 Перенести в другое место")
+        self.btn_create_shortcut = QPushButton("🏷 Создать ярлык")
         self.settings_dialog = None   # создаётся лениво, один раз — см. _open_settings()
 
         # ── Тело окна ─────────────────────────────────────────────────────────
@@ -465,13 +497,13 @@ class UpdaterUI(QWidget):
 
     def _connect_signals(self):
         self.lbl_folder.mousePressEvent   = lambda _: self._choose_folder()
-        self.lbl_shortcut.mousePressEvent = lambda _: self._create_shortcut()
 
         self.btn_launch.clicked.connect(self._on_status_button_clicked)
         self.btn_patch.clicked.connect(self._patch_skyrim)
         self.btn_verify.clicked.connect(self._verify_files)
-        self.btn_launch_mo2.clicked.connect(self._launch_game)
+        self.btn_launch_mo2.clicked.connect(self._open_mo2)
         self.btn_move_install.clicked.connect(self._move_install_location)
+        self.btn_create_shortcut.clicked.connect(self._create_shortcut)
         self.btn_latest.clicked.connect(self._update_to_latest)
         self.btn_update.clicked.connect(self._update_to_selected)
         self.btn_rollback.clicked.connect(self._rollback_to_selected)
@@ -1002,17 +1034,23 @@ class UpdaterUI(QWidget):
 
     # ── Launch ────────────────────────────────────────────────────────────────
 
-    def _launch_game(self):
+    def _resolve_mo2_exe(self) -> "str | None":
+        """Общая часть для _launch_game()/_open_mo2() — путь к
+        ModOrganizer.exe с проверкой, что папка выбрана и файл реально на
+        месте. Возвращает None (и сам пишет причину в лог), если нет."""
         if not self._full_local_path:
             self._append_log("Выберите папку MO2")
-            return
+            return None
         mo_exe = str(Path(self._full_local_path) / MO2_EXE)
         if not Path(mo_exe).exists():
             self._append_log(f"{MO2_EXE} не найден в {self._full_local_path}")
-            return
+            return None
+        return mo_exe
+
+    def _spawn_mo2(self, mo_exe: str, args: list, log_msg: str) -> None:
         try:
             subprocess.Popen(
-                [mo_exe, MO2_SKSE_ARG],
+                [mo_exe, *args],
                 # cwd — папка самого MO2_EXE (с MO2_EXE = "MO2p/ModOrganizer.exe"
                 # это <local_dir>/MO2p, не корень установки) — тот же принцип,
                 # что MO2Configurator.create_shortcut() уже применяет к
@@ -1021,9 +1059,28 @@ class UpdaterUI(QWidget):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self._append_log("▶ Запуск TESVAE... (подождите 10–80 сек)")
+            self._append_log(log_msg)
         except Exception as e:
             self._append_log(f"Ошибка запуска: {e}")
+
+    def _launch_game(self):
+        """Умная кнопка статуса в режиме "Играть" — сразу запускает игру
+        через SKSE-ярлык MO2 (MO2_SKSE_ARG), минуя собственный интерфейс
+        MO2. Отдельно от _open_mo2() — у них разное назначение, не просто
+        два способа попасть к одному и тому же."""
+        mo_exe = self._resolve_mo2_exe()
+        if not mo_exe:
+            return
+        self._spawn_mo2(mo_exe, [MO2_SKSE_ARG], "▶ Запуск TESVAE... (подождите 10–80 сек)")
+
+    def _open_mo2(self):
+        """"Запустить Mod Organizer 2" в меню сборки — прямой запрос
+        пользователя: должен открывать сам MO2 (его интерфейс), БЕЗ
+        ключей запуска игры, в отличие от умной кнопки статуса выше."""
+        mo_exe = self._resolve_mo2_exe()
+        if not mo_exe:
+            return
+        self._spawn_mo2(mo_exe, [], "▶ Запуск Mod Organizer 2...")
 
     # ── Status button (▶ TESVAE — install/update/play в одной кнопке) ──────────
 
@@ -1449,6 +1506,7 @@ class UpdaterUI(QWidget):
             self.settings_dialog = SettingsDialog(
                 self,
                 self.btn_verify, self.btn_launch_mo2, self.btn_move_install,
+                self.btn_create_shortcut,
                 debug_mode_getter=self._get_debug_mode,
                 debug_mode_setter=self._set_debug_mode,
             )
