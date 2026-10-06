@@ -8,9 +8,12 @@
 
 Макет (780×500) — левая колонка "инструментов" (патч/проверка/очистка)
 переехала в диалог настроек (⚙, см. _open_settings()/ui/settings_dialog.py,
-прямой запрос пользователя 2026-09-22):
+прямой запрос пользователя 2026-09-22). 2026-10-06: "🛠 Проверить файлы"
+переехала ОТТУДА в отдельное "меню сборки" (📦, см. _open_build_menu()) —
+та кнопка относится к текущей сборке, не к лаунчеру в целом, ⚙ остаётся
+только для патча/очистки Skyrim/режима отладки:
   ┌─────────────────────────────────────────────────────────────┐
-  │ [📁 папка]  [🏷 ярлык]          Версия: ...      [⚙] [🌙] │
+  │ [📁 папка]  [🏷 ярлык]     Версия: ...     [📦] [⚙] [🌙] │
   ├────────────────────────────────┬──────────────────────────────┤
   │ Center (постер, шире)          │ Right 230px                  │
   │       poster.png               │ Выберите версию:             │
@@ -28,6 +31,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,7 +43,7 @@ from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QPixmap, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QProgressBar, QTextEdit, QFileDialog, QFrame, QComboBox,
-    QSizePolicy, QMessageBox, QApplication,
+    QSizePolicy, QMessageBox, QApplication, QMenu, QWidgetAction,
 )
 
 from config import (
@@ -235,6 +239,19 @@ class UpdaterUI(QWidget):
         self.btn_settings.setToolTip("Настройки")
         self.btn_settings.clicked.connect(self._open_settings)
 
+        # "Меню сборки" — прямой запрос пользователя 2026-10-06: "🛠
+        # Проверить файлы" (полный рескан, сравнение с сервером) переехал
+        # СЮДА из глобального диалога настроек (⚙) — та кнопка логически
+        # относится к ТЕКУЩЕЙ выбранной сборке, не к лаунчеру целиком.
+        # См. _open_build_menu() за то, как это всплывающее меню
+        # построено (QWidgetAction оборачивает уже существующий
+        # self.btn_verify — тот же приём "реродительствуем готовый
+        # виджет", что SettingsDialog уже использует для своих кнопок).
+        self.btn_build_menu = QPushButton("📦")
+        self.btn_build_menu.setFixedSize(32, 32)
+        self.btn_build_menu.setToolTip("Меню сборки")
+        self.btn_build_menu.clicked.connect(self._open_build_menu)
+
         self.btn_theme = QPushButton("🌙")
         self.btn_theme.setFixedSize(32, 32)
         self.btn_theme.clicked.connect(self._toggle_theme)
@@ -243,6 +260,7 @@ class UpdaterUI(QWidget):
         top.addWidget(self.lbl_shortcut)
         top.addStretch()
         top.addWidget(self.lbl_version)
+        top.addWidget(self.btn_build_menu)
         top.addWidget(self.btn_settings)
         top.addWidget(self.btn_theme)
         main_v.addLayout(top)
@@ -265,6 +283,7 @@ class UpdaterUI(QWidget):
         self.btn_verify = QPushButton("🛠 Проверить файлы")
         self.btn_revert = QPushButton("♻️ Очистить Skyrim")
         self.settings_dialog = None   # создаётся лениво, один раз — см. _open_settings()
+        self._build_menu = None       # создаётся лениво, один раз — см. _open_build_menu()
 
         # Растяжка слева от центра — без своей левой колонки (190px) центр+
         # правая панель (340+230+10=580) уже не заполняют всю ширину окна
@@ -646,7 +665,57 @@ class UpdaterUI(QWidget):
         # реальный текст ИМЕННО выбранной версии, не только текущей.
         v = self._version_meta.get(label)
         notes = (v.get("description") if v else "") or "Описание отсутствует"
+        size_bytes = v.get("total_size") if v else None
+        if size_bytes:
+            notes = f"{notes}\n\nРазмер сборки: {self._fmt_size(size_bytes)}"
         self.lbl_version_info.setPlainText(notes)
+
+    @staticmethod
+    def _fmt_size(n: int) -> str:
+        for u in ("B", "KB", "MB", "GB"):
+            if n < 1024:
+                return f"{n:.1f} {u}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def _build_size_for_task(self, task: dict) -> "int | None":
+        """Размер сборки (в байтах) для версии, которую ставит этот
+        task dict — из уже загруженного VersionLoaderWorker.version_meta_loaded
+        (см. _on_version_meta_loaded()/_version_meta). None, если версия
+        неизвестна (сеть ещё не отдала метаданные) — вызывающий код
+        (_check_disk_space()) в этом случае просто пропускает проверку,
+        не изобретая число, которого нет."""
+        label = task.get("version_label") or self._current_version
+        v = self._version_meta.get(label) if label else None
+        return v.get("total_size") if v else None
+
+    def _check_disk_space(self, local_dir: str, size_bytes: "int | None") -> bool:
+        """True — можно продолжать установку. Прямой запрос пользователя
+        2026-10-06: перед установкой сравнить размер сборки со свободным
+        местом на выбранном диске и предупредить, если сборка больше.
+        size_bytes=None (размер сборки ещё не известен — сеть не успела
+        отдать версии/манифест) — пропускаем проверку молча, не блокируя
+        установку из-за отсутствия данных, которых мы просто не можем
+        знать заранее."""
+        if not size_bytes:
+            return True
+        try:
+            free = shutil.disk_usage(local_dir).free
+        except OSError as e:
+            self._append_log(f"⚠️ Не удалось проверить свободное место на диске: {e}")
+            return True
+        if free >= size_bytes:
+            return True
+        reply = QMessageBox.warning(
+            self, "Недостаточно места на диске",
+            f"Размер сборки: {self._fmt_size(size_bytes)}\n"
+            f"Свободно на диске: {self._fmt_size(free)}\n\n"
+            "Свободного места может не хватить для завершения установки. "
+            "Продолжить всё равно?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     # ── Poster loader ─────────────────────────────────────────────────────────
 
@@ -1032,6 +1101,20 @@ class UpdaterUI(QWidget):
             self._append_log("Рабочий процесс уже запущен")
             return
 
+        # Проверка свободного места — прямой запрос пользователя
+        # 2026-10-06. Единая точка: ВСЕ пути install/update/rollback
+        # (_install()/_update_to_latest()/_update_to_selected(), а
+        # _rollback_to_selected() просто зовёт последнюю) строят task
+        # dict и зовут именно эту функцию — проверять в каждом месте по
+        # отдельности было бы легко забыть на следующей правке.
+        if task.get("type") == "install":
+            size_bytes = self._build_size_for_task(task)
+            if not self._check_disk_space(task["local_dir"], size_bytes):
+                self.is_installing = False
+                self._refresh_status_button()
+                self._enable_buttons()
+                return
+
         # Единая точка инъекции debug_mode — все install/update/rollback
         # task dict'ы (3 места выше) проходят через эту функцию, так что
         # добавлять ключ в каждом месте по отдельности не нужно и негде
@@ -1259,12 +1342,42 @@ class UpdaterUI(QWidget):
         if self.settings_dialog is None:
             self.settings_dialog = SettingsDialog(
                 self,
-                self.btn_patch, self.btn_verify, self.btn_revert,
+                self.btn_patch, self.btn_revert,
                 restart_explorer_fn=self._restart_explorer,
                 debug_mode_getter=self._get_debug_mode,
                 debug_mode_setter=self._set_debug_mode,
             )
         self.settings_dialog.exec()
+
+    # ── Build menu ────────────────────────────────────────────────────────────
+
+    def _open_build_menu(self):
+        """Всплывающее меню ТЕКУЩЕЙ сборки (📦) — прямой запрос
+        пользователя 2026-10-06: "кнопку проверить в файлы нужно
+        поместить в меню сборки", отдельно от общих настроек лаунчера
+        (⚙). Сейчас единственный пункт — полный рескан ("🛠 Проверить
+        файлы", VerifyWorker, функционал не изменился ни на строчку),
+        но меню — не одноразовый диалог, задел под будущие per-build
+        пункты (например, открыть папку кеша/сборки) не нужно
+        переделывать с нуля.
+
+        Строится ОДИН РАЗ (не при каждом клике), тот же принцип
+        ленивого создания с реродительством готового виджета, что уже
+        применяет SettingsDialog для btn_patch/btn_revert —
+        self.btn_verify создаётся в _build_ui() как обычно (нужен
+        ALL_BTNS/_disable_buttons() для блокировки во время
+        install/verify/patch), просто никогда не добавлялся в layout
+        главного окна; QWidgetAction.setDefaultWidget() вставляет его
+        как есть внутрь QMenu — click-обработчик/текст кнопки/
+        enable-disable логика в main_window.py не меняются вообще."""
+        if self._build_menu is None:
+            self._build_menu = QMenu(self)
+            action = QWidgetAction(self._build_menu)
+            self.btn_verify.setFixedHeight(32)
+            action.setDefaultWidget(self.btn_verify)
+            self._build_menu.addAction(action)
+        self._build_menu.exec(self.btn_build_menu.mapToGlobal(
+            self.btn_build_menu.rect().bottomLeft()))
 
     def _get_debug_mode(self) -> bool:
         return bool(self.config.get("debug_mode", False))

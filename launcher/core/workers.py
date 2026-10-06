@@ -195,12 +195,24 @@ class VersionLoaderWorker(ThreadSafeWorker):
                 # Сборка публиковалась ДО того, как панель начала
                 # версионировать (2026-09-29) — истории для неё нет,
                 # показываем ровно то единственное, что показывали до
-                # этой правки. Без version_key в meta_map — DownloadWorker
-                # трактует отсутствие ключа как "текущая версия", что тут
-                # и есть единственно возможное значение.
+                # этой правки. version_key=None в meta_map —
+                # DownloadWorker трактует отсутствие ключа как "текущая
+                # версия", что тут и есть единственно возможное значение.
+                # total_size считаем сами из raw.get("files") — у сборок
+                # без истории версий панель не отдаёт total_size готовым
+                # (это поле есть только в записях list_versions()), а
+                # предупреждение о нехватке места на диске (см.
+                # main_window.py::_check_disk_space()) нужно для ЛЮБОЙ
+                # сборки, не только версионированных.
                 current_label = f"build #{raw.get('build_number', '?')}"
                 labels = [current_label]
-                meta_map = {}
+                total_size = sum(info.get("size", 0) for info in raw.get("files", {}).values())
+                meta_map = {current_label: {
+                    "version_key": None,
+                    "description": raw.get("description", "") or "",
+                    "build_number": raw.get("build_number"),
+                    "total_size": total_size,
+                }}
                 description = raw.get("description", "") or ""
 
             self.versions_loaded.emit(labels)

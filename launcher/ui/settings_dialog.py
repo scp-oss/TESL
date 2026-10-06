@@ -7,14 +7,21 @@
 окне, перенесены сюда — плюс новый переключатель "Режим отладки" (см.
 core/debug_log.py, ui/main_window.py::_set_debug_mode()).
 
-Кнопки patch/verify/revert передаются УЖЕ СОЗДАННЫМИ из main_window.py, не
-создаются здесь — это те же самые self.btn_patch/self.btn_verify/
-self.btn_revert, на которые ссылается main_window.py::ALL_BTNS/
-_disable_buttons() для блокировки во время параллельных операций (install/
-verify/patch не должны идти одновременно). Переезд в этот диалог меняет
-только их визуального родителя — Qt переставляет parent автоматически при
+Кнопки patch/revert передаются УЖЕ СОЗДАННЫМИ из main_window.py, не
+создаются здесь — это те же самые self.btn_patch/self.btn_revert, на
+которые ссылается main_window.py::ALL_BTNS/_disable_buttons() для
+блокировки во время параллельных операций (install/verify/patch не
+должны идти одновременно). Переезд в этот диалог меняет только их
+визуального родителя — Qt переставляет parent автоматически при
 addWidget() в layout нового виджета, сама Python-ссылка и вся логика
 enable/disable в main_window.py остаётся рабочей без изменений.
+
+**btn_verify переехал ОТСЮДА в «меню сборки» 2026-10-06** (прямой
+запрос пользователя: "кнопку проверить в файлы нужно поместить в меню
+сборки") — см. main_window.py::_open_build_menu(). Сам полный-рескан
+функционал кнопки (VerifyWorker — перечитывает и сравнивает ВСЕ файлы
+с сервером) не изменился ни на строчку, поменялось только то, в каком
+UI-контейнере кнопка физически показывается.
 """
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -28,7 +35,6 @@ class SettingsDialog(QDialog):
         self,
         parent,
         btn_patch: QPushButton,
-        btn_verify: QPushButton,
         btn_revert: QPushButton,
         restart_explorer_fn,
         debug_mode_getter,
@@ -42,7 +48,7 @@ class SettingsDialog(QDialog):
         v.setSpacing(10)
 
         v.addWidget(QLabel("Инструменты:"))
-        for b in (btn_patch, btn_verify, btn_revert):
+        for b in (btn_patch, btn_revert):
             b.setFixedHeight(36)
             v.addWidget(b)
 

@@ -18,12 +18,36 @@
 
 Намеренно БЕЗ Qt-зависимости — `core/workers.py::DownloadWorker` оборачивает
 этот класс в Qt-сигналы через колбэки, сам ничего не решает.
+
+2026-10-06, прямой запрос пользователя, три связанные правки:
+- Кеш чанков (`_ChunkCache`) переехал с системного temp в
+  `<local_dir>/cache/chunks` — "желательно не в темп, а в той же папке
+  где находится сборка". Чистится с нуля на каждый install() (ephemeral
+  в пределах одного прогона); `_cleanup_extra_files()` явно исключает
+  весь `cache/` из метлы "лишних файлов", иначе собственный журнал
+  резюме (см. ниже) удалялся бы на каждой установке.
+- `resume_state.jsonl` (см. `_load_resume_done()`/`_ResumeStateWriter`)
+  — журнал файлов, чья sha256-верификация уже ПОДТВЕРЖДЕНА прошлым
+  прогоном; `diff()` пропускает дорогой полный хэш для них (только
+  дешёвую проверку существование+размер) — пауза+закрытие+повторный
+  запуск лаунчера больше не перехэшируют каждый уже корректный файл
+  заново. Запись в журнал — СТРОГО после успешной верификации в
+  `_assemble()`, никогда раньше: если процесс падает до этого момента,
+  записи просто не будет, и diff() обработает файл как обычно (не
+  "доверие вслепую" частично записанному файлу).
+- Прогрессивная очистка кэша по чанку (`_ChunkCache.release()`) — не
+  новая правка, уже существовала; подтверждена повторным разбором и
+  явно задокументирована здесь по прямому вопросу пользователя,
+  вырастет ли кэш до полного объёма сборки — нет, не вырастет: чанк
+  удаляется с диска сразу, как только последний файл, которому он
+  нужен, либо собрался (успешно или неуспешно), либо был "обречён"
+  из-за неудачной закачки — см. `release()`'s собственный докстринг.
 """
 
 import hashlib
+import json
 import os
 import shutil
-import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -76,6 +100,83 @@ def _fmt_eta(seconds: float) -> str:
     if m:
         return f"{m}м{s:02d}с"
     return f"{s}с"
+
+
+_RESUME_STATE_FILENAME = "resume_state.jsonl"
+
+
+def _load_resume_done(cache_dir: Path) -> Dict[str, str]:
+    """{rel_out_path: file_hash} уже ПОДТВЕРЖДЁННО (пост-верификация,
+    см. _ResumeStateWriter.mark_done()) собранных файлов из ПРЕДЫДУЩЕГО
+    прогона install() — см. diff()'s `resume_done` параметр за то, как
+    это используется, чтобы не перехэшировать 170К+ файлов заново
+    только потому, что пользователь поставил установку на паузу и
+    закрыл лаунчер (живой запрос пользователя 2026-10-06).
+
+    JSONL, не один JSON-блоб — добавление записи должно быть O(1)
+    (append+flush), не переписыванием всего файла на каждый из 170К+
+    файлов сборки. Последняя строка на путь побеждает (на случай редкой
+    гонки двух процессов дописывающих один файл — не ожидается в норме,
+    один install() на сборку за раз, но дешёво защититься построением
+    словаря так, чтобы порядок строк сам решал конфликт предсказуемо).
+    Отсутствие файла/битая строка — не ошибка, просто "истории нет",
+    diff() в этом случае ведёт себя как раньше (полный хэш)."""
+    path = cache_dir / _RESUME_STATE_FILENAME
+    done: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    done[rec["path"]] = rec["hash"]
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue  # битая строка (обрыв записи при крэше) — просто пропускаем её
+    except OSError:
+        pass
+    return done
+
+
+class _ResumeStateWriter:
+    """Append-only журнал "файл X с хэшем Y полностью собран и
+    верифицирован" — ПИШЕТСЯ ТОЛЬКО когда _assemble() уже подтвердил
+    sha256 всего файла (ok=True), никогда раньше. Это и есть гарантия
+    безопасности против живого риска "частично записанный файл после
+    крэша тихо принят как готовый": если процесс падает ДО того, как
+    эта строка попала на диск (в любой момент до полной верификации),
+    при следующем запуске записи просто не будет — diff() увидит файл
+    как обычно (размер не совпадёт с ожидаемым, или хэш не совпадёт) и
+    перекачает/пересоберёт его заново, как и должно быть. Запись только
+    ПОСЛЕ верификации — единственное, что делает пропуск повторного
+    хэша на следующем запуске безопасным, не "доверием на слово"."""
+
+    def __init__(self, cache_dir: Path):
+        self._lock = threading.Lock()
+        self._path = cache_dir / _RESUME_STATE_FILENAME
+        try:
+            self._f = open(self._path, "a", encoding="utf-8")
+        except OSError:
+            self._f = None  # диск недоступен для записи — молча не персистим, install() всё равно работает
+
+    def mark_done(self, rel_out_path: str, file_hash: str) -> None:
+        if self._f is None:
+            return
+        line = json.dumps({"path": rel_out_path, "hash": file_hash}, ensure_ascii=False)
+        with self._lock:
+            try:
+                self._f.write(line + "\n")
+                self._f.flush()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        if self._f is not None:
+            try:
+                self._f.close()
+            except OSError:
+                pass
 
 
 def _reorder_for_disk_locality(chunk_order: List[str], client, max_workers: int) -> List[str]:
@@ -295,9 +396,11 @@ class _ChunkCache:
     без остановки, несмотря на номинальный `bytes_limit=768MB`. Прямое
     предложение пользователя ("сделать папку кеш... выгружается в сыром
     виде, а потом собирается") — `put()` теперь пишет байты чанка на
-    диск (в отдельную temp-папку, см. `install()`), не держит их в
-    питоновском `dict`; `get_many()` читает их обратно с диска прямо
-    перед сборкой файла. Разница в нагрузке на диск клиента —
+    диск (в `cache_dir`, который передаёт `install()` — с 2026-10-06 это
+    `<local_dir>/cache/chunks`, не системный temp, см. install()'s
+    собственный комментарий за причину), не держит их в питоновском
+    `dict`; `get_many()` читает их обратно с диска прямо перед сборкой
+    файла. Разница в нагрузке на диск клиента —
     ничтожная (один write + один read на чанк, в среднем несколько
     сотен КБ, против самого сетевого скачивания и последующей записи в
     целевой файл, которые и так уже происходят) — тот же базовый
@@ -490,12 +593,25 @@ class ChunkInstaller:
             self._dbg_last_flush = now
         self.on_log("\n".join(batch))
 
-    def diff(self, entries: List[FileEntry]) -> List[FileEntry]:
+    def diff(self, entries: List[FileEntry], resume_done: Optional[Dict[str, str]] = None) -> List[FileEntry]:
         """Сравнивает entries с локальными файлами (существование/размер/
         sha256). Параллелится отдельным пулом (diff_workers — диск+CPU, не
         сеть) и репортит прогресс/ETA скользящим окном — раньше шло
         однопоточно без единого признака прогресса на 173К файлах,
-        выглядело как зависание (живая жалоба 2026-09-22)."""
+        выглядело как зависание (живая жалоба 2026-09-22).
+
+        `resume_done` — {rel_out_path: file_hash} уже ПОДТВЕРЖДЁННО
+        собранных файлов из прошлого прогона install() (см.
+        _load_resume_done()/_ResumeStateWriter) — прямой запрос
+        пользователя 2026-10-06: пауза+закрытие+повторный запуск
+        лаунчера не должны заново перехэшировать каждый уже корректно
+        стоящий файл сборки (дорого на 170К+ файлов). Для файла,
+        найденного в этой карте С ТЕМ ЖЕ file_hash — всё ещё проверяем
+        дёшево (существование+размер), но пропускаем дорогой полный
+        sha256; расхождение означает, что что-то изменилось (другая
+        версия поверх, файл тронули руками) — resume_done просто не
+        матчится, обычная дорогая проверка срабатывает как раньше, это
+        НЕ доверие вслепую."""
         to_process: List[FileEntry] = []
         total = len(entries)
         if total == 0:
@@ -506,6 +622,7 @@ class ChunkInstaller:
         last_sample_t = time.time()
         last_sample_done = 0
         smoothed_rate = 0.0
+        resume_done = resume_done or {}
 
         def _check(e: FileEntry):
             local_path = self.local_dir / Path(e.rel_out_path.replace("/", os.sep))
@@ -516,6 +633,8 @@ class ChunkInstaller:
             lp = _win_long_path(local_path)
             if not os.path.exists(lp) or os.path.getsize(lp) != e.size:
                 return e, True
+            if resume_done.get(e.rel_out_path) == e.file_hash:
+                return e, False
             return e, _sha256_file(local_path) != e.file_hash
 
         diff_workers = min(8, max(4, os.cpu_count() or 4))
@@ -558,9 +677,26 @@ class ChunkInstaller:
             self.on_log("⚠️ Chunk-манифест пуст")
             return True
 
+        # Папка кеша — ВНУТРИ самой сборки (<local_dir>/cache), не
+        # системный TEMP: прямой запрос пользователя 2026-10-06 ("желательно
+        # не в темп, а в той же папке где находится сборка"). `chunks/`
+        # (сырые байты чанков "в работе", см. _ChunkCache) — чистим с нуля
+        # на каждый install() (ephemeral в пределах одного прогона,
+        # прошлый мусор от прерванного процесса нам не нужен и не
+        # идентифицируем, какому chunk_id какой файл принадлежал бы без
+        # повторного planning()). `resume_state.jsonl` (см. ниже) лежит
+        # РЯДОМ, не внутри — его явно нужно переживать между прогонами,
+        # ради чего всё это и делается.
+        cache_dir = self.local_dir / "cache"
+        chunks_dir = cache_dir / "chunks"
+        shutil.rmtree(chunks_dir, ignore_errors=True)
+
         self.on_log(f"📋 Файлов в chunk-манифесте: {len(entries)}")
         self.on_log("🔍 Сравниваем с локальными файлами...")
-        to_process = self.diff(entries)
+        resume_done = _load_resume_done(cache_dir)
+        if resume_done:
+            self.on_log(f"⏩ Из прошлого прогона уже подтверждено: {len(resume_done)} файлов — хэш не пересчитываем")
+        to_process = self.diff(entries, resume_done=resume_done)
 
         if not to_process:
             self.on_log("✅ Все файлы актуальны")
@@ -589,16 +725,18 @@ class ChunkInstaller:
             for cid in unique_ids:
                 chunk_to_files.setdefault(cid, []).append(i)
 
-        # Временная папка для "сырых" чанков на диске (см. _ChunkCache's
-        # докстринг за полную картину живого инцидента 2026-10-06) —
-        # системный temp, НЕ self.local_dir: та может быть на медленном/
-        # сетевом пути (как было в реальном случае, P:\...), системный
-        # temp обычно на локальном SSD и явно отделён от самой установки.
-        # Чистится в конце install() (все три выхода из функции ниже) —
-        # ЗДЕСЬ, а не в __init__/__del__ "_ChunkCache", раз именно
-        # install() владеет жизненным циклом этого конкретного прогона.
-        cache_dir = Path(tempfile.mkdtemp(prefix="tesl_chunk_cache_"))
-        cache = _ChunkCache(self.cache_bytes_limit, cache_dir, debug_log=self._dbg_emit if self.debug else None)
+        # "Сырые" байты чанков на диске — chunks_dir (см. cache_dir/
+        # chunks_dir выше и _ChunkCache's докстринг за полную картину
+        # живого инцидента 2026-10-06, который завёл дисковый кэш как
+        # таковой) — ephemeral в пределах ЭТОГО прогона install(),
+        # уже очищена с нуля выше. Чистится в конце install() (все три
+        # выхода из функции ниже) — ЗДЕСЬ, а не в __init__/__del__
+        # "_ChunkCache", раз именно install() владеет жизненным циклом
+        # этого конкретного прогона. `resume_writer` (журнал подтверждённо
+        # собранных файлов, см. _ResumeStateWriter) — отдельный от
+        # chunks_dir файл, persist между прогонами, не чистится.
+        cache = _ChunkCache(self.cache_bytes_limit, chunks_dir, debug_log=self._dbg_emit if self.debug else None)
+        resume_writer = _ResumeStateWriter(cache_dir)
         for cid, files in chunk_to_files.items():
             cache.plan(cid, len(files))
             self._dbg(f"🐛 plan {cid[:12]} needed_by={len(files)} files={files}")
@@ -688,6 +826,13 @@ class ChunkInstaller:
                     ok_files += 1
                 else:
                     fail_files += 1
+            if ok:
+                # ТОЛЬКО здесь, ТОЛЬКО после успешной sha256-верификации
+                # ВСЕГО файла — см. _ResumeStateWriter за то, почему этот
+                # порядок единственно безопасный (запись раньше момента
+                # подтверждения = риск принять частично записанный файл
+                # за готовый после крэша).
+                resume_writer.mark_done(e.rel_out_path, e.file_hash)
             self._dbg(f"🐛 assemble[{i}] {'OK' if ok else 'FAIL'} {e.rel_out_path}")
             cache.release(file_chunk_ids[i])
 
@@ -741,7 +886,8 @@ class ChunkInstaller:
                     if self.debug:
                         self._dbg_emit(None, force=True)
                     self.on_log("⏹ Загрузка остановлена")
-                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    resume_writer.close()
+                    shutil.rmtree(chunks_dir, ignore_errors=True)
                     return False
 
                 if not in_flight:
@@ -839,11 +985,12 @@ class ChunkInstaller:
             # install() — этот класс не знает, что за client ему дали, и
             # не обязан знать про chunk_error_summary() вообще.
 
+        resume_writer.close()
         removed = self._cleanup_extra_files(entries)
         if removed:
             self.on_log(f"🗑 Удалено лишних файлов: {removed}")
 
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.rmtree(chunks_dir, ignore_errors=True)
 
         if fail_files:
             self.on_log(f"❌ Установка завершена с ошибками: {ok_files} ок, {fail_files} ошибок")
@@ -855,11 +1002,24 @@ class ChunkInstaller:
         manifest_paths = {
             str(Path(e.rel_out_path.replace("/", os.sep))) for e in entries
         }
+        cache_dir_name = "cache"  # см. install() — <local_dir>/cache, не часть манифеста ни одной сборки
         removed = 0
         for f in self.local_dir.rglob("*"):
             if f.is_file():
-                rel = str(f.relative_to(self.local_dir))
-                if rel not in manifest_paths:
+                rel = f.relative_to(self.local_dir)
+                # Папка кеша (<local_dir>/cache/...) — свой собственный
+                # жизненный цикл (chunks/ чистится в install() сама,
+                # resume_state.jsonl переживает установки намеренно), не
+                # часть ни одного манифеста сборки по определению. Без
+                # этого исключения эта метка-сборщик удалила бы
+                # resume_state.jsonl на каждом install() (манифест
+                # никогда не содержит "cache/..." как настоящий путь
+                # сборки) — что обесценило бы весь смысл Request A, не
+                # просто тратило бы место зря.
+                if rel.parts and rel.parts[0] == cache_dir_name:
+                    continue
+                rel_s = str(rel)
+                if rel_s not in manifest_paths:
                     try:
                         f.unlink()
                         removed += 1
