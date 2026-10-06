@@ -110,6 +110,37 @@ def _rewrite_game_path_everywhere(content: str, game_folder: str) -> "tuple[str,
     return new_content, new_content != content
 
 
+# "Диалог подтверждения смены игры" — ровно та строка, которая
+# всплывает у пользователя, когда MO2 видит, что управляемая игра
+# "сменилась" (а она технически "меняется" каждый раз, когда
+# `_rewrite_game_path_everywhere()` переписывает gamePath= на новой
+# машине) — прямой запрос 2026-10-06: "давай ещё диалоговое окно из мо
+# уберем". Реальный ключ подтверждён присланным пользователем
+# ModOrganizer.ini (`[Settings]` → `show_change_game_confirmation=true`).
+_SETTINGS_SECTION_RE = re.compile(r"^\[Settings\]\s*$", re.MULTILINE)
+
+
+def _set_plain_ini_key(content: str, key: str, value: str, section_header_re: "re.Pattern") -> "tuple[str, bool]":
+    """Переписывает голую (без @ByteArray) строку `key=...` на `value`
+    ВЕЗДЕ, где бы она ни стояла — если строки нет вообще, вставляет её
+    сразу после заголовка секции `section_header_re` (создавая ключ, а
+    не полагаясь на то, что MO2 сам допишет его с дефолтом `true`).
+    Намеренно НЕ трогает `@ByteArray(...)`-обёрнутые поля — это для
+    простых булевых/строковых настроек, не для путей."""
+    key_re = re.compile(rf"^{re.escape(key)}\s*=.*$", re.MULTILINE)
+    new_line = f"{key}={value}"
+    if key_re.search(content):
+        new_content = key_re.sub(new_line, content, count=1)
+        return new_content, new_content != content
+
+    m = section_header_re.search(content)
+    if not m:
+        return content, False
+    insert_at = m.end()
+    new_content = content[:insert_at] + "\n" + new_line + content[insert_at:]
+    return new_content, True
+
+
 def _win_path(path) -> str:
     if isinstance(path, Path):
         path = str(path)
@@ -476,6 +507,15 @@ class MO2Configurator:
             # ровно этот путь, хоть что-то да заменится.
             content = content.replace(MO2_INI_SKYRIM_PLACEHOLDER_FWD, fwd)
             content = content.replace(MO2_INI_SKYRIM_PLACEHOLDER_DBL, dbl)
+
+            # Диалог "подтвердите смену управляемой игры" — MO2 его
+            # показывает именно потому, что gamePath= выше реально
+            # изменился (см. докстринг _SETTINGS_SECTION_RE). Прямой
+            # запрос пользователя — выключить, та же логика живёт
+            # отдельно в tools/fix_mo2_paths.py для уже скачанных сборок.
+            content, _ = _set_plain_ini_key(
+                content, "show_change_game_confirmation", "false", _SETTINGS_SECTION_RE,
+            )
 
             with open(ini_path, "w", encoding="utf-8") as f:
                 f.write(content)

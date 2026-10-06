@@ -43,6 +43,7 @@ import re
 import sys
 
 _GAME_PATH_LINE_RE = re.compile(r"^gamePath\s*=\s*(.*)$", re.MULTILINE)
+_SETTINGS_SECTION_RE = re.compile(r"^\[Settings\]\s*$", re.MULTILINE)
 
 
 def _normalize(path: str) -> str:
@@ -86,6 +87,25 @@ def rewrite_everywhere(content: str, new_game_folder: str):
     return new_content, new_content != content, old_fwd
 
 
+def set_plain_ini_key(content: str, key: str, value: str, section_header_re):
+    """Переписывает голую (без @ByteArray) строку `key=...` на `value`
+    везде, где бы она ни стояла; если строки нет вообще, вставляет её
+    сразу после заголовка секции `section_header_re`. Возвращает
+    (новый_текст, изменилось_ли)."""
+    key_re = re.compile(rf"^{re.escape(key)}\s*=.*$", re.MULTILINE)
+    new_line = f"{key}={value}"
+    if key_re.search(content):
+        new_content = key_re.sub(new_line, content, count=1)
+        return new_content, new_content != content
+
+    m = section_header_re.search(content)
+    if not m:
+        return content, False
+    insert_at = m.end()
+    new_content = content[:insert_at] + "\n" + new_line + content[insert_at:]
+    return new_content, True
+
+
 def main() -> int:
     root = os.path.dirname(os.path.abspath(__file__))
     ini_path = os.path.join(root, "MO2p", "ModOrganizer.ini")
@@ -114,15 +134,22 @@ def main() -> int:
     with open(ini_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    new_content, changed, old_path = rewrite_everywhere(content, skyrim_dir)
+    new_content, path_changed, old_path = rewrite_everywhere(content, skyrim_dir)
 
     if old_path is None:
         print("❌ Не удалось найти строку gamePath= в ModOrganizer.ini — файл повреждён или имеет неожиданный формат.")
         input("\nНажмите Enter для выхода...")
         return 1
 
-    if not changed:
-        print(f"✅ gamePath= уже указывает на правильный путь ({_normalize(skyrim_dir)}) — ничего менять не нужно.")
+    # "Диалог подтверждения смены игры" — MO2 показывает его именно
+    # потому, что gamePath= реально изменился (та же причина, что и у
+    # исходной ошибки) — выключаем заодно, прямой запрос пользователя.
+    new_content, dialog_changed = set_plain_ini_key(
+        new_content, "show_change_game_confirmation", "false", _SETTINGS_SECTION_RE,
+    )
+
+    if not path_changed and not dialog_changed:
+        print(f"✅ gamePath= уже указывает на правильный путь ({_normalize(skyrim_dir)}), диалог подтверждения уже выключен — ничего менять не нужно.")
         input("\nНажмите Enter для выхода...")
         return 0
 
@@ -132,10 +159,13 @@ def main() -> int:
     with open(ini_path, "w", encoding="utf-8") as f:
         f.write(new_content)
 
-    print(f"Старый путь в файле:      {old_path}")
-    print(f"Новый (реальный) путь:    {_normalize(skyrim_dir)}")
+    if path_changed:
+        print(f"Старый путь в файле:      {old_path}")
+        print(f"Новый (реальный) путь:    {_normalize(skyrim_dir)}")
+    if dialog_changed:
+        print("Диалог подтверждения смены игры — выключен (show_change_game_confirmation=false).")
     print(f"Резервная копия сохранена: {backup_path}")
-    print("✅ ModOrganizer.ini исправлен — путь к игре обновлён везде (включая SKSE/Creation Kit и другие ярлыки).")
+    print("✅ ModOrganizer.ini исправлен.")
     input("\nНажмите Enter для выхода...")
     return 0
 
