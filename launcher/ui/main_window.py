@@ -946,7 +946,11 @@ class UpdaterUI(QWidget):
         try:
             subprocess.Popen(
                 [mo_exe, MO2_SKSE_ARG],
-                cwd=self._full_local_path,
+                # cwd — папка самого MO2_EXE (с MO2_EXE = "MO2p/ModOrganizer.exe"
+                # это <local_dir>/MO2p, не корень установки) — тот же принцип,
+                # что MO2Configurator.create_shortcut() уже применяет к
+                # WorkingDirectory ярлыка.
+                cwd=str(Path(mo_exe).parent),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -1216,10 +1220,22 @@ class UpdaterUI(QWidget):
             self.config.setdefault("installed_versions", {})[self._build_key()] = self._pending_install_target
             self._save_config()
         self._pending_install_target = None
+
+        # Живой баг 2026-10-06: is_installing сбрасывался в False ТОЛЬКО
+        # внутри ветки `if self.is_installing:` НИЖЕ — а _refresh_status_button()
+        # вызывалась ВЫШЕ неё, пока is_installing был ещё True. У неё самой
+        # есть ранний `if self.is_installing: return` (кнопка не должна
+        # дёргаться во время установки) — из-за порядка вызовов этот guard
+        # срабатывал и на САМОМ завершении установки тоже, и кнопка
+        # статуса навсегда застревала на "⏹ Отменить" (режим "cancel"),
+        # даже после полностью успешной установки — реальный симптом
+        # пользователя "кнопки играть не появилось хотя вроде бы установил".
+        # Фикс: сбрасываем is_installing ДО пересчёта кнопки.
+        was_installing = self.is_installing
+        self.is_installing = False
         self._refresh_status_button()
 
-        if self.is_installing:
-            self.is_installing = False
+        if was_installing:
             # Кнопка статуса уже пересчитана выше (_refresh_status_button()) —
             # раньше здесь стояло self.btn_install.setText("📥 Установить"),
             # безусловно откатывая подпись на "Установить" независимо от

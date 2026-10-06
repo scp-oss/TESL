@@ -324,8 +324,17 @@ SKYRIM_AE_DLC_FILES = [
 # Полный список из 100+ файлов можно добавить при необходимости.
 
 # ── ModOrganizer ──────────────────────────────────────────────────────────────
-MO2_EXE           = "ModOrganizer.exe"
-MO2_INI           = "ModOrganizer.ini"
+# С префиксом компонента ("MO2p/...") — живой баг 2026-10-06: без него
+# _launch_game()/_refresh_status_button()/MO2Configurator искали
+# ModOrganizer.exe прямо в корне установки (<local_dir>/ModOrganizer.exe),
+# а TESL-Manager публикует MO2 под компонентным префиксом
+# (<local_dir>/MO2p/ModOrganizer.exe, см. его CLAUDE.md "COMPONENT_NAMES")
+# — подтверждено пользователем реальным путём на диске после успешной
+# установки. Из-за этого "не найден" ModOrganizer.exe держал статусную
+# кнопку в режиме "Установить" вместо "Играть" даже после полной,
+# успешной установки.
+MO2_EXE           = "MO2p/ModOrganizer.exe"
+MO2_INI           = "MO2p/ModOrganizer.ini"
 MO2_SHORTCUT_NAME = "TESVAE"
 MO2_SKSE_ARG      = "moshortcut://:SKSE"
 

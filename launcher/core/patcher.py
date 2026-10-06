@@ -24,7 +24,7 @@ import config as _config   # для DAV_PASSWORD — см. _get_session()
 from config import (
     DAV_BASE_URL, DAV_USERNAME,
     PATCHER_REMOTE_PATH, APPDATA_DIR,
-    MO2_EXE, MO2_SHORTCUT_NAME, MO2_SKSE_ARG,
+    MO2_EXE, MO2_INI, MO2_SHORTCUT_NAME, MO2_SKSE_ARG,
     MO2_INI_SKYRIM_PLACEHOLDER_FWD, MO2_INI_SKYRIM_PLACEHOLDER_DBL,
 )
 from core.workers import ThreadSafeWorker
@@ -365,8 +365,15 @@ class MO2Configurator:
 
     @staticmethod
     def update_ini(mo2_dir: str, game_folder: str, log=print) -> bool:
-        """Заменяет placeholder-пути в ModOrganizer.ini на реальные."""
-        ini_path = _win_path(os.path.join(mo2_dir, "ModOrganizer.ini"))
+        """Заменяет placeholder-пути в ModOrganizer.ini на реальные.
+
+        mo2_dir — КОРЕНЬ установки (local_dir), не папка MO2 — MO2_INI уже
+        несёт в себе компонентный префикс ("MO2p/ModOrganizer.ini", см.
+        config.py), был раньше голым "ModOrganizer.ini" и потому всегда
+        искал файл прямо в корне установки, где его в компонентной
+        раскладке никогда не было (живой баг 2026-10-06).
+        """
+        ini_path = _win_path(os.path.join(mo2_dir, MO2_INI))
         if not os.path.exists(ini_path):
             log(f"ModOrganizer.ini не найден: {ini_path}")
             return False
