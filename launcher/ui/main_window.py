@@ -1502,11 +1502,16 @@ class UpdaterUI(QWidget):
         `Documents\\My Games\\Skyrim Special Edition`, создавая папку при
         необходимости), не дожидаясь следующей установки/обновления —
         см. core/ini_profile.py и core/workers.py::ApplyIniProfileWorker.
-        Независима от `_full_local_path` (целевая папка — путь ОС, не
-        путь MO2) — не требует выбранной папки сборки."""
+        Запись самих ini-файлов не зависит от `_full_local_path`
+        (целевая папка — путь ОС, не путь MO2) — работает и без
+        выбранной папки сборки. `_full_local_path`, если уже выбрана,
+        передаётся отдельно — ТОЛЬКО для необязательного DPI-фикса
+        (`resolve_skyrim_exe_path()`/`ensure_dpi_compat_override()`,
+        см. их докстринги) — без неё этот шаг просто пропускается,
+        остальное не меняется."""
         if self.ini_profile_worker is not None:
             return
-        self.ini_profile_worker = ApplyIniProfileWorker()
+        self.ini_profile_worker = ApplyIniProfileWorker(self._full_local_path)
         self.ini_profile_thread = QThread()
         self.ini_profile_worker.moveToThread(self.ini_profile_thread)
         self.ini_profile_worker.log.connect(self._append_log)

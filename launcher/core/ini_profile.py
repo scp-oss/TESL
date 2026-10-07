@@ -47,7 +47,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import config
 
@@ -417,6 +417,101 @@ def _detect_gpu() -> Tuple[str, int]:
     return name or UNKNOWN_GPU, vram_mb
 
 
+_DPI_LAYERS_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+_DPI_OVERRIDE_FLAG = "~ HIGHDPIAWARE"
+
+
+def resolve_skyrim_exe_path(local_dir: Optional[str]) -> Optional[str]:
+    """Best-effort поиск реального `SkyrimSE.exe` для DPI-фикса ниже —
+    тот же приоритет, что `PostInstallWorker.run()` уже использует для
+    `update_ini()` (бандл-компонент ЭТОЙ сборки, `<local_dir>/Skyrim/`,
+    первым; внешний `SkyrimChecker` — фолбэк, только если компонента
+    нет). Используется отдельно от `PostInstallWorker` в кнопке
+    "Применить профиль" (`ApplyIniProfileWorker`), у которой нет уже
+    готового результата детекта под рукой. Никогда не бросает исключение
+    — `None`, если ничего не нашлось (DPI-шаг в этом случае просто
+    пропускается, запись самих ini-файлов не зависит от этого)."""
+    if not local_dir:
+        return None
+    try:
+        bundled = Path(local_dir) / config.SKYRIM_COMPONENT_DIR / config.SKYRIM_EXE_NAME
+        if bundled.is_file():
+            return str(bundled)
+    except Exception:
+        pass
+    try:
+        from core.skyrim_checker import SkyrimChecker
+        result = SkyrimChecker().check()
+        if result.found and result.skyrim_dir:
+            exe = Path(result.skyrim_dir) / config.SKYRIM_EXE_NAME
+            if exe.is_file():
+                return str(exe)
+    except Exception:
+        pass
+    return None
+
+
+def ensure_dpi_compat_override(exe_path: str, log=print) -> bool:
+    """Отключает DPI-виртуализацию Windows ИМЕННО для процесса
+    `SkyrimSE.exe` — регистровый эквивалент галочки на вкладке
+    "Совместимость" exe-файла: "Переопределение масштабирования
+    высокого разрешения экрана, выполняемое: Приложение". Это
+    задокументированное поведение самой Windows (та же галочка пишет
+    РОВНО это значение в реестр — не наш собственный/изобретённый
+    механизм), доступное через реестр без похода в UI вручную на
+    каждой машине.
+
+    **Зачем, живой повод 2026-10-06**: ноутбук с физическим 2560x1440
+    и масштабом ОС 120% — игра открывалась "как 4K", на экране было
+    видно только 1/4 картинки (симптом согласуется: если движок
+    рендерит в 2x больше пикселей по каждому измерению, видимая без
+    компенсации область — ровно 1/4 по площади). `_detect_resolution()`
+    уже пишет в `SkyrimPrefs.ini` правильное ФИЗИЧЕСКОЕ разрешение
+    (через `EnumDisplaySettingsW`, не зависящий от DPI-awareness
+    читающего процесса, см. его докстринг) — но это не делает DPI-
+    осведомлённым сам процесс SkyrimSE.exe. Если движок (в отличие от
+    НАШЕГО launcher.exe, которому `_ensure_dpi_aware()` ставит
+    awareness напрямую в коде) сам DPI-неосведомлён, Windows
+    виртуализирует ЕГО окно независимо от цифр в ini — тот же класс
+    искажения, что `_detect_resolution()`'s докстринг уже объясняет
+    для `GetSystemMetrics`, просто здесь он бьёт по чужому процессу,
+    код которого мы не контролируем, значит чинится только снаружи,
+    через реестр.
+
+    Правит только СВОЙ флаг — если у `exe_path` уже есть другие
+    записанные Windows/пользователем флаги совместимости в этом же
+    значении (разделяются пробелом), они не трогаются, `~
+    HIGHDPIAWARE` дописывается в конец, только если его там ещё нет
+    (идемпотентно — повторный вызов на уже пропатченном пути не
+    дублирует флаг). `winreg is None` (не Windows) или любая ошибка
+    реестра — тихий `False`, не бросает исключение (вызывается из
+    best-effort `apply_ini_profile()`)."""
+    if winreg is None:
+        return False
+    try:
+        resolved = str(Path(exe_path).resolve())
+    except Exception:
+        resolved = exe_path
+    try:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, _DPI_LAYERS_KEY, 0,
+            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+        ) as key:
+            try:
+                current, _ = winreg.QueryValueEx(key, resolved)
+            except FileNotFoundError:
+                current = ""
+            if _DPI_OVERRIDE_FLAG in current:
+                return True
+            new_value = f"{current} {_DPI_OVERRIDE_FLAG}".strip()
+            winreg.SetValueEx(key, resolved, 0, winreg.REG_SZ, new_value)
+            log(f"🖴 DPI-переопределение (Приложение) включено для {resolved}")
+            return True
+    except Exception as e:
+        log(f"⚠️ Не удалось выставить DPI-переопределение для {resolved}: {e}")
+        return False
+
+
 def _pick_tier(vram_mb: int) -> str:
     for threshold, tier in _TIER_VRAM_THRESHOLDS_MB:
         if vram_mb >= threshold:
@@ -467,12 +562,19 @@ def check_templates() -> Dict[str, list]:
     return problems
 
 
-def apply_ini_profile(log=print) -> bool:
+def apply_ini_profile(log=print, skyrim_exe_path: Optional[str] = None) -> bool:
     """Главная точка входа — детект железа → рендер обоих шаблонов →
     запись в `Documents/My Games/Skyrim Special Edition` (создаёт папку,
     если её нет). Best-effort: любая ошибка логируется и возвращает
     False, не бросает исключение (вызывается из PostInstallWorker —
-    не должно ронять остальной post-install)."""
+    не должно ронять остальной post-install).
+
+    `skyrim_exe_path` (опционально) — если известен реальный путь к
+    `SkyrimSE.exe` (см. `resolve_skyrim_exe_path()`), заодно выставляет
+    DPI-переопределение для него (`ensure_dpi_compat_override()`) —
+    чинит рассинхрон разрешения на экранах с масштабом ОС ≠100%, см. её
+    докстринг. Без пути (не передан/не найден) этот шаг просто
+    пропускается — запись самих ini-файлов от него не зависит."""
     try:
         res_w, res_h = _detect_resolution()
         gpu_name, vram_mb = _detect_gpu()
@@ -497,6 +599,10 @@ def apply_ini_profile(log=print) -> bool:
             (dest_dir / fname).write_text(rendered, encoding="utf-8")
 
         log(f"✅ Skyrim.ini/SkyrimPrefs.ini применены в {dest_dir}")
+
+        if skyrim_exe_path:
+            ensure_dpi_compat_override(skyrim_exe_path, log=log)
+
         return True
     except Exception as e:
         log(f"❌ Не удалось применить профиль графики: {e}")

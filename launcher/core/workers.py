@@ -608,10 +608,15 @@ class ApplyIniProfileWorker(ThreadSafeWorker):
     log      = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
+    def __init__(self, local_dir: str = ""):
+        super().__init__()
+        self.local_dir = local_dir
+
     def run(self):
-        from core.ini_profile import apply_ini_profile
+        from core.ini_profile import apply_ini_profile, resolve_skyrim_exe_path
         try:
-            ok = apply_ini_profile(log=self.log.emit)
+            exe_path = resolve_skyrim_exe_path(self.local_dir)
+            ok = apply_ini_profile(log=self.log.emit, skyrim_exe_path=exe_path)
             self.finished.emit(ok, "Профиль применён" if ok else "Не удалось применить профиль")
         except Exception as e:
             import traceback
@@ -664,20 +669,29 @@ class PostInstallWorker(ThreadSafeWorker):
             # оставался тем, что был записан при публикации/на прошлой
             # машине. SkyrimChecker (внешний поиск) — фолбэк только для
             # сборок, которые НЕ возят Skyrim как компонент.
+            skyrim_dir = None
             bundled_skyrim_dir = os.path.join(self.local_dir, _config.SKYRIM_COMPONENT_DIR)
             if os.path.isdir(bundled_skyrim_dir):
                 self.log.emit(f"Skyrim найден в составе сборки: {bundled_skyrim_dir}")
                 MO2Configurator.update_ini(self.local_dir, bundled_skyrim_dir, log=self.log.emit)
+                skyrim_dir = bundled_skyrim_dir
             else:
                 result = SkyrimChecker().check(log=self.log.emit)
                 if result.found:
                     MO2Configurator.update_ini(self.local_dir, result.skyrim_dir, log=self.log.emit)
+                    skyrim_dir = result.skyrim_dir
 
             # Skyrim.ini/SkyrimPrefs.ini (Documents\My Games\...) — не
             # зависит от того, нашёлся ли Skyrim выше: папка должна быть
             # готова до первого запуска игры, best-effort (см.
             # core/ini_profile.py — никогда не роняет post-install).
-            apply_ini_profile(log=self.log.emit)
+            # skyrim_exe_path (если найден выше) заодно чинит DPI-
+            # виртуализацию самого SkyrimSE.exe — см.
+            # core/ini_profile.py::ensure_dpi_compat_override().
+            skyrim_exe_path = (
+                os.path.join(skyrim_dir, _config.SKYRIM_EXE_NAME) if skyrim_dir else None
+            )
+            apply_ini_profile(log=self.log.emit, skyrim_exe_path=skyrim_exe_path)
 
             icon_path, arg = fetch_shortcut_assets(log=self.log.emit)
 
