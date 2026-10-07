@@ -39,6 +39,41 @@ deprecated в новых сборках Windows, но пока ещё обычн
 что уже докачивает иконку/аргумент ярлыка и создаёт .lnk после установки
 (см. его собственный докстринг про перенос с GUI-потока) — best-effort,
 никогда не валит весь post-install, если что-то пошло не так.
+
+## Шаблоны — теперь per-build через `documents/` на панели, не только bundled (2026-10-07)
+
+Прямой запрос пользователя: "фиксы ты писал под эту сборку, возможно я
+залью другую, и они применятся к ней" — справедливо про САМИ ШАБЛОНЫ
+(`TIER_VALUES`/`COMMON_VALUES` ниже подобраны под конкретный модлист
+TESVAE, не универсальны), НЕ про саму машинерию подстановки/детекта
+железа (она одинаково корректна для любой MO2+Skyrim сборки, трогать
+её ради этого не нужно).
+
+`fetch_panel_ini_templates()` — читает `documents/` АКТИВНОЙ сборки
+(`config.CURRENT_BUILD_ID`) через уже существующий, ничем не
+изменённый механизм TESL-Manager/TESL-Panel (`documents_tab.py`
+публикует произвольные файлы под `documents/<имя>` + `extras_manifest.
+json`, `PanelDepotClient.fetch_extras_manifest()`/`get_bytes()` в этом
+репозитории уже умели их читать — ни строчки на стороне панели/
+менеджера менять не пришлось). Ищет документы с именами РОВНО
+`Skyrim.ini`/`SkyrimPrefs.ini` (`enabled` истинно или отсутствует) —
+это те же самые файлы-С-ПЛЕЙСХОЛДЕРАМИ (`{{SHADOW_DISTANCE}}` и т.п.),
+просто загруженные оператором как обычный "шаблон настроек" через
+вкладку "📄 Документы и патчи", без какой-либо специальной обработки
+на стороне менеджера/панели — они хранят байты как есть.
+
+Требует ОБА файла найденными разом — половинчатый профиль (один шаблон
+с панели, другой bundled) рисковал бы смешать несогласованные друг с
+другом значения. Если НЕ оба найдены (сборка ещё не публиковала свои
+documents-шаблоны, панель недоступна, сборка не выбрана) —
+`apply_ini_profile()` откатывается на `assets/ini_profile/*.ini`
+(bundled, те же, что и раньше) с явным предупреждением в лог — другими
+словами, пока оператор не прикрепит `Skyrim.ini`/`SkyrimPrefs.ini`
+через панель к НОВОЙ сборке, та сборка продолжит получать
+TESVAE-калиброванные значения по умолчанию (то же поведение, что было
+до этого фикса) — НЕ полную тишину/отказ — сознательный выбор не
+ломать уже работающую фичу ради сборки, которая ещё не существует,
+но явно предупреждает в логе о риске, который пользователь описал.
 """
 from __future__ import annotations
 
@@ -546,6 +581,53 @@ def render_template(text: str, values: Dict[str, str]) -> Tuple[str, list]:
     return _PLACEHOLDER_RE.sub(_sub, text), missing
 
 
+def fetch_panel_ini_templates(log=print) -> Optional[Dict[str, str]]:
+    """См. раздел "Шаблоны — теперь per-build через documents/..." в
+    докстринге модуля. Возвращает `{"Skyrim.ini": text, "SkyrimPrefs.
+    ini": text}` ТОЛЬКО если оба найдены и включены — иначе `None`
+    (вызывающий код откатывается на bundled). Никогда не бросает
+    исключение — любая сетевая/парсинг ошибка тихо даёт `None`, тот же
+    принцип best-effort, что и у всего остального в этом модуле."""
+    build_id = config.CURRENT_BUILD_ID
+    if not build_id:
+        return None
+    client = None
+    try:
+        from core.panel_client import PanelDepotClient
+        client = PanelDepotClient(build_id)
+        manifest = client.fetch_extras_manifest()
+        wanted = {name.lower(): name for name in _TEMPLATE_FILES}
+        found: Dict[str, str] = {}
+        for entry in manifest.get("documents", []):
+            if entry.get("enabled", True) is False:
+                continue
+            path = entry.get("path", "")
+            basename = path.rsplit("/", 1)[-1]
+            canon = wanted.get(basename.lower())
+            if not canon or canon in found:
+                continue
+            data = client.get_bytes(path)
+            if data is None:
+                continue
+            try:
+                found[canon] = data.decode("utf-8")
+            except Exception:
+                continue
+        if len(found) == len(_TEMPLATE_FILES):
+            log("📄 Найдены собственные шаблоны Skyrim.ini/SkyrimPrefs.ini "
+                "для этой сборки на панели (documents/) — используются они.")
+            return found
+        return None
+    except Exception:
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 def check_templates() -> Dict[str, list]:
     """Офлайн-проверка ("заодно проверь их"): для каждого шаблонного
     файла и каждого тира — какие плейсхолдеры остались бы незаполненными.
@@ -589,9 +671,21 @@ def apply_ini_profile(log=print, skyrim_exe_path: Optional[str] = None) -> bool:
         dest_dir = get_skyrim_documents_dir()
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        panel_templates = fetch_panel_ini_templates(log=log)
+        if panel_templates is None:
+            log(
+                "ℹ️ Для этой сборки нет собственных шаблонов Skyrim.ini/"
+                "SkyrimPrefs.ini на панели (documents/) — используется "
+                "встроенный профиль, подобранный под TESVAE; для ДРУГОЙ "
+                "сборки он может быть неверным."
+            )
+
         for fname in _TEMPLATE_FILES:
-            src = config.get_asset_path(f"assets/ini_profile/{fname}")
-            text = src.read_text(encoding="utf-8")
+            if panel_templates is not None:
+                text = panel_templates[fname]
+            else:
+                src = config.get_asset_path(f"assets/ini_profile/{fname}")
+                text = src.read_text(encoding="utf-8")
             rendered, missing = render_template(text, values)
             if missing:
                 log(f"⚠️ {fname}: не заполнены плейсхолдеры {missing} — файл не записан")
