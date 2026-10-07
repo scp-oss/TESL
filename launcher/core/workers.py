@@ -656,6 +656,7 @@ class PostInstallWorker(ThreadSafeWorker):
         from core.patcher import MO2Configurator
         from core.depot_client import fetch_shortcut_assets
         from core.ini_profile import apply_ini_profile
+        from core.patch_runner import run_patches
 
         try:
             # Приоритет 1: Skyrim как компонент ЭТОЙ ЖЕ сборки
@@ -692,6 +693,15 @@ class PostInstallWorker(ThreadSafeWorker):
                 os.path.join(skyrim_dir, _config.SKYRIM_EXE_NAME) if skyrim_dir else None
             )
             apply_ini_profile(log=self.log.emit, skyrim_exe_path=skyrim_exe_path)
+
+            # Патчи сборки (patch/, .bat) — прямой запрос пользователя
+            # 2026-10-07, после явного подтверждения ("да, подключить
+            # сейчас") — см. core/patch_runner.py за полный контракт
+            # (очередь/идемпотентность/окружение, передаваемое патчу).
+            # После ini-профиля (патч может зависеть от уже правильно
+            # настроенной игры), до создания ярлыка (ярлык — финальный
+            # шаг "всё готово").
+            run_patches(self.local_dir, _config.CURRENT_BUILD_ID, log=self.log.emit)
 
             icon_path, arg = fetch_shortcut_assets(log=self.log.emit)
 

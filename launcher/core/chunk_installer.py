@@ -1170,21 +1170,28 @@ class ChunkInstaller:
         manifest_paths = {
             str(Path(e.rel_out_path.replace("/", os.sep))) for e in entries
         }
-        cache_dir_name = "cache"  # см. install() — <local_dir>/cache, не часть манифеста ни одной сборки
+        # <local_dir>/cache/... и <local_dir>/patch/... — свои собственные,
+        # не относящиеся к manifest'у сборки папки (launcher-local state),
+        # не часть манифеста ни одной сборки по определению. cache/ —
+        # resume_state.jsonl/applied_patches.json (переживают установки
+        # намеренно, см. их собственные докстринги); patch/ — локальный
+        # кэш уже скачанных .bat-патчей (core/patch_runner.py), который
+        # сам по себе не числится ни в одном depot_manifest.json (patch/
+        # живёт на сервере отдельно от упакованного депо, см.
+        # TESL-Manager::documents_tab.py). Без этого исключения эта
+        # метла-сборщик удалила бы resume_state.jsonl/applied_patches.json
+        # на каждом install() и .bat-файлы патчей сразу после их
+        # применения — обесценило бы и "Request A" резюмирования, и
+        # идемпотентность патчей (функционально не критично для
+        # идемпотентности — та завязана на cache/applied_patches.json,
+        # не на наличие самого .bat на диске — но лишняя потеря данных
+        # без необходимости).
+        excluded_top_dirs = {"cache", "patch"}
         removed = 0
         for f in self.local_dir.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(self.local_dir)
-                # Папка кеша (<local_dir>/cache/...) — свой собственный
-                # жизненный цикл (chunks/ чистится в install() сама,
-                # resume_state.jsonl переживает установки намеренно), не
-                # часть ни одного манифеста сборки по определению. Без
-                # этого исключения эта метка-сборщик удалила бы
-                # resume_state.jsonl на каждом install() (манифест
-                # никогда не содержит "cache/..." как настоящий путь
-                # сборки) — что обесценило бы весь смысл Request A, не
-                # просто тратило бы место зря.
-                if rel.parts and rel.parts[0] == cache_dir_name:
+                if rel.parts and rel.parts[0] in excluded_top_dirs:
                     continue
                 rel_s = str(rel)
                 if rel_s not in manifest_paths:
